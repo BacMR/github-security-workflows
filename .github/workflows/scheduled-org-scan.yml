@@ -201,6 +201,8 @@ jobs:
             -c "UPDATE scan_runs SET finished_at = now() WHERE id = ${SCAN_RUN_ID}"
 
       - name: Write Security Summary
+        env:
+          REPO_MATRIX: ${{ needs.discover.outputs.repo_matrix }}
         run: |
           set -euo pipefail
           set -a; source "$SECSCAN_HOME/etc/db.env"; set +a
@@ -211,24 +213,41 @@ jobs:
             echo ""
             echo "## Findings by Repository"
             echo ""
+            echo "Every repository in the scan is listed — including clean ones."
+            echo "\`⚠ no data\` means the scan job produced no report for that repo."
+            echo ""
             echo "| Repository | Gitleaks | Trivy | Semgrep | Total |"
             echo "|---|---:|---:|---:|---:|"
-            "$PSQL" -qtA -F'|' -c "
-              SELECT repository,
-                     coalesce(sum(findings_count) FILTER (WHERE scanner = 'gitleaks'), 0),
-                     coalesce(sum(findings_count) FILTER (WHERE scanner = 'trivy'),    0),
-                     coalesce(sum(findings_count) FILTER (WHERE scanner = 'semgrep'),  0),
-                     sum(findings_count)
-              FROM repo_scans
-              WHERE scan_run_id = ${SCAN_RUN_ID}
-              GROUP BY repository
-              ORDER BY sum(findings_count) DESC, repository
-            " | sed 's/^/| /; s/|/ | /g; s/$/ |/' | tr -s ' '
+            "$PSQL" -qtA -F'|' -v matrix="$REPO_MATRIX" -c "
+              WITH per_repo AS (
+                SELECT repository,
+                       coalesce(sum(findings_count) FILTER (WHERE scanner = 'gitleaks'), 0) AS gitleaks,
+                       coalesce(sum(findings_count) FILTER (WHERE scanner = 'trivy'),    0) AS trivy,
+                       coalesce(sum(findings_count) FILTER (WHERE scanner = 'semgrep'),  0) AS semgrep,
+                       coalesce(sum(findings_count), 0) AS total
+                FROM repo_scans
+                WHERE scan_run_id = ${SCAN_RUN_ID}
+                GROUP BY repository
+              )
+              SELECT m.repo,
+                     coalesce(p.gitleaks::text, '–'),
+                     coalesce(p.trivy::text,    '–'),
+                     coalesce(p.semgrep::text,  '–'),
+                     CASE WHEN p.repository IS NULL THEN '⚠ no data'
+                          ELSE p.total::text END
+              FROM jsonb_array_elements_text(:'matrix'::jsonb) AS m(repo)
+              LEFT JOIN per_repo p ON p.repository = m.repo
+              ORDER BY coalesce(p.total, -1) DESC, m.repo
+            " | awk -F'|' '{printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5}'
             echo ""
             TOTAL=$("$PSQL" -qtA -c "
               SELECT coalesce(sum(findings_count), 0)
               FROM repo_scans WHERE scan_run_id = ${SCAN_RUN_ID}")
-            echo "**Total findings: ${TOTAL}**"
+            SCANNED=$("$PSQL" -qtA -c "
+              SELECT count(DISTINCT repository)
+              FROM repo_scans WHERE scan_run_id = ${SCAN_RUN_ID}")
+            EXPECTED=$(jq -r 'length' <<< "$REPO_MATRIX")
+            echo "**Repositories: ${SCANNED}/${EXPECTED} scanned — Total findings: ${TOTAL}**"
             echo ""
             echo "Full reports are stored in the \`secscan\` database (\`repo_scans\`, \`findings\`)."
           } >> "$GITHUB_STEP_SUMMARY"
