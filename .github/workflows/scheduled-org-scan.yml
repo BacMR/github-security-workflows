@@ -1,0 +1,234 @@
+name: Org Security Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_repos:
+        description: "Comma-separated repos to scan (owner/repo). Leave blank for all repos."
+        required: false
+        default: ""
+
+  schedule:
+    - cron: "0 5 * * *"
+
+concurrency:
+  group: org-security-scan
+  cancel-in-progress: false
+
+env:
+  ORG: Lebjawi-Tech
+  SECSCAN_HOME: /opt/security-scanner
+
+# ============================================================
+# 1. DISCOVER REPOS + OPEN SCAN RUN IN DB
+# ============================================================
+
+jobs:
+
+  discover:
+    name: Discover Repositories
+    runs-on: [self-hosted, secscan]
+    timeout-minutes: 10
+
+    outputs:
+      repo_matrix: ${{ steps.matrix.outputs.repos }}
+      scan_run_id: ${{ steps.open-run.outputs.scan_run_id }}
+
+    steps:
+
+      - name: Get Repo List (Org Scope)
+        env:
+          TEST_REPOS: ${{ inputs.test_repos }}
+        run: |
+          set -euo pipefail
+          export GH_TOKEN="$(gh auth token)"
+
+          if [ -n "$TEST_REPOS" ]; then
+            echo "Using test repository list"
+            echo "$TEST_REPOS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | sed '/^$/d' > repos.txt
+          else
+            echo "Scanning all non-archived repositories in $ORG"
+            gh repo list "$ORG" \
+              --no-archived \
+              --limit 1000 \
+              --json nameWithOwner \
+              --jq '.[].nameWithOwner' \
+              > repos.txt
+          fi
+
+          echo "Repositories selected for scanning:"
+          wc -l < repos.txt
+          cat repos.txt
+
+      - name: Build Matrix
+        id: matrix
+        run: |
+          set -euo pipefail
+          jq -R -s 'split("\n") | map(select(length > 0))' repos.txt > repos.json
+          echo "repos=$(jq -c . repos.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Open Scan Run in Database
+        id: open-run
+        run: |
+          set -euo pipefail
+          set -a; source "$SECSCAN_HOME/etc/db.env"; set +a
+
+          SCAN_RUN_ID=$("$SECSCAN_HOME/bin/psql" -qtA -v ON_ERROR_STOP=1 \
+            -c "INSERT INTO scan_runs (github_run_id, run_type) VALUES (${{ github.run_id }}, 'org') RETURNING id")
+
+          echo "Opened scan run ${SCAN_RUN_ID}"
+          echo "scan_run_id=${SCAN_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+# ============================================================
+# 2. SCAN REPOSITORIES
+#
+# Tools are pre-installed under /opt/security-scanner.
+# Repo clones are cached between runs; each scanner's JSON
+# report is written straight to the secscan Postgres database.
+# ============================================================
+
+  scan:
+    name: Scan
+    needs: discover
+    runs-on: [self-hosted, secscan]
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        repository: ${{ fromJson(needs.discover.outputs.repo_matrix) }}
+
+    env:
+      SCAN_RUN_ID: ${{ needs.discover.outputs.scan_run_id }}
+      REPO: ${{ matrix.repository }}
+
+    steps:
+
+      - name: Add Scanner Tools to PATH
+        run: echo "$SECSCAN_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Sync Repository (Cached Clone)
+        run: |
+          set -euo pipefail
+          export GH_TOKEN="$(gh auth token)"
+
+          CACHE="$SECSCAN_HOME/cache/repos/$REPO"
+
+          # Authenticate via gh's credential helper so no token is
+          # ever written into the cached clone's git config.
+          GIT_AUTH=(-c credential.helper= -c "credential.helper=!gh auth git-credential")
+
+          if [ -d "$CACHE/.git" ]; then
+            echo "Updating cached clone"
+            git "${GIT_AUTH[@]}" -C "$CACHE" fetch origin --prune --tags --force
+            git "${GIT_AUTH[@]}" -C "$CACHE" remote set-head origin --auto
+            DEFAULT=$(git -C "$CACHE" symbolic-ref --short refs/remotes/origin/HEAD | sed 's|^origin/||')
+            git -C "$CACHE" checkout -f "$DEFAULT"
+            git -C "$CACHE" reset --hard "origin/$DEFAULT"
+          else
+            echo "Cloning fresh (full history)"
+            mkdir -p "$(dirname "$CACHE")"
+            git "${GIT_AUTH[@]}" clone "https://github.com/$REPO.git" "$CACHE"
+          fi
+
+      - name: Run Gitleaks (Full History)
+        run: |
+          set -euo pipefail
+          gitleaks git "$SECSCAN_HOME/cache/repos/$REPO" \
+            --redact \
+            --report-format json \
+            --report-path "$RUNNER_TEMP/gitleaks.json" \
+            --exit-code 0
+
+      - name: Run Trivy
+        env:
+          TRIVY_CACHE_DIR: /opt/security-scanner/cache/trivy
+        run: |
+          set -euo pipefail
+          trivy fs \
+            --scanners vuln \
+            --pkg-types os,library \
+            --severity CRITICAL,HIGH \
+            --format json \
+            --output "$RUNNER_TEMP/trivy.json" \
+            --exit-code 0 \
+            "$SECSCAN_HOME/cache/repos/$REPO"
+
+      - name: Run Semgrep
+        run: |
+          set +e
+          semgrep scan \
+            --config p/default \
+            --json \
+            --output "$RUNNER_TEMP/semgrep.json" \
+            --metrics off \
+            "$SECSCAN_HOME/cache/repos/$REPO"
+          echo "Semgrep exit code: $?"
+          exit 0
+
+      - name: Write Reports to Database
+        if: always()
+        run: |
+          set -euo pipefail
+          secscan-ingest "$SCAN_RUN_ID" "$REPO" gitleaks "$RUNNER_TEMP/gitleaks.json"
+          secscan-ingest "$SCAN_RUN_ID" "$REPO" trivy    "$RUNNER_TEMP/trivy.json"
+          secscan-ingest "$SCAN_RUN_ID" "$REPO" semgrep  "$RUNNER_TEMP/semgrep.json"
+
+# ============================================================
+# 3. AGGREGATE
+#
+# Close the scan run and summarize results from the database.
+# ============================================================
+
+  aggregate:
+    name: Aggregate Results
+    needs: [discover, scan]
+    if: always() && needs.discover.result == 'success'
+    runs-on: [self-hosted, secscan]
+    timeout-minutes: 10
+
+    env:
+      SCAN_RUN_ID: ${{ needs.discover.outputs.scan_run_id }}
+
+    steps:
+
+      - name: Close Scan Run
+        run: |
+          set -euo pipefail
+          set -a; source "$SECSCAN_HOME/etc/db.env"; set +a
+
+          "$SECSCAN_HOME/bin/psql" -q -v ON_ERROR_STOP=1 \
+            -c "UPDATE scan_runs SET finished_at = now() WHERE id = ${SCAN_RUN_ID}"
+
+      - name: Write Security Summary
+        run: |
+          set -euo pipefail
+          set -a; source "$SECSCAN_HOME/etc/db.env"; set +a
+          PSQL="$SECSCAN_HOME/bin/psql"
+
+          {
+            echo "# 🛡️ Org Security Scan — Run ${SCAN_RUN_ID}"
+            echo ""
+            echo "## Findings by Repository"
+            echo ""
+            echo "| Repository | Gitleaks | Trivy | Semgrep | Total |"
+            echo "|---|---:|---:|---:|---:|"
+            "$PSQL" -qtA -F'|' -c "
+              SELECT repository,
+                     coalesce(sum(findings_count) FILTER (WHERE scanner = 'gitleaks'), 0),
+                     coalesce(sum(findings_count) FILTER (WHERE scanner = 'trivy'),    0),
+                     coalesce(sum(findings_count) FILTER (WHERE scanner = 'semgrep'),  0),
+                     sum(findings_count)
+              FROM repo_scans
+              WHERE scan_run_id = ${SCAN_RUN_ID}
+              GROUP BY repository
+              ORDER BY sum(findings_count) DESC, repository
+            " | sed 's/^/| /; s/|/ | /g; s/$/ |/' | tr -s ' '
+            echo ""
+            TOTAL=$("$PSQL" -qtA -c "
+              SELECT coalesce(sum(findings_count), 0)
+              FROM repo_scans WHERE scan_run_id = ${SCAN_RUN_ID}")
+            echo "**Total findings: ${TOTAL}**"
+            echo ""
+            echo "Full reports are stored in the \`secscan\` database (\`repo_scans\`, \`findings\`)."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,526 @@
+name: Security Scan
+
+# Reusable workflow for per-repo scanning. Call it from a repo's own
+# workflow (see examples/pr-security.yml). Runs on GitHub-hosted
+# runners so untrusted PR code never executes on the VPS.
+
+on:
+  workflow_call:
+    inputs:
+      scan_mode:
+        description: "Scan mode: pr or full"
+        required: false
+        type: string
+        default: "pr"
+
+      enforce_new_findings:
+        description: "Fail the security gate when new findings are detected"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+
+# ============================================================
+# GITLEAKS
+# ============================================================
+
+jobs:
+
+  gitleaks:
+    name: Gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    steps:
+
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Gitleaks
+        run: |
+          set -euo pipefail
+
+          wget -q \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+
+          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      # ======================================================
+      # PR SCAN
+      # ======================================================
+
+      - name: Run Gitleaks - PR Changes
+        if: inputs.scan_mode == 'pr'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set +e
+
+          echo "Scanning PR commit range:"
+          echo "${BASE_SHA}..${HEAD_SHA}"
+
+          gitleaks git \
+            --log-opts="${BASE_SHA}..${HEAD_SHA}" \
+            --verbose \
+            --redact \
+            --report-format json \
+            --report-path gitleaks-new-findings.json
+
+          echo "Gitleaks exit code: $?"
+
+          # Gitleaks returns 1 when findings are detected.
+          # The security-gate job decides whether findings block the PR.
+          exit 0
+
+      # ======================================================
+      # FULL SCAN
+      # ======================================================
+
+      - name: Run Gitleaks - Full Repository
+        if: inputs.scan_mode == 'full'
+        run: |
+          set +e
+
+          echo "Running full historical Gitleaks scan..."
+
+          gitleaks git \
+            --verbose \
+            --redact \
+            --report-format json \
+            --report-path gitleaks-full-report.json
+
+          echo "Gitleaks exit code: $?"
+          exit 0
+
+      - name: Ensure Gitleaks Report Exists
+        if: always()
+        env:
+          SCAN_MODE: ${{ inputs.scan_mode }}
+        run: |
+          if [ "$SCAN_MODE" = "pr" ]; then
+            [ -f gitleaks-new-findings.json ] || echo "[]" > gitleaks-new-findings.json
+          else
+            [ -f gitleaks-full-report.json ] || echo "[]" > gitleaks-full-report.json
+          fi
+
+      - name: Upload Gitleaks Report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gitleaks-results
+          path: |
+            gitleaks-new-findings.json
+            gitleaks-full-report.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+# ============================================================
+# TRIVY
+# ============================================================
+
+  trivy:
+    name: Trivy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+
+    steps:
+
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # ======================================================
+      # PR MODE — scan BASE and PR separately;
+      # the security-gate job compares the results.
+      # ======================================================
+
+      - name: Create Base Worktree
+        if: inputs.scan_mode == 'pr'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git worktree add --detach ../base-repository "${BASE_SHA}"
+
+      - name: Scan Base Repository
+        if: inputs.scan_mode == 'pr'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ../base-repository
+          format: json
+          output: trivy-base.json
+          severity: CRITICAL,HIGH
+          scanners: vuln
+          vuln-type: os,library
+          exit-code: "0"
+
+      - name: Scan PR Repository
+        if: inputs.scan_mode == 'pr'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy-pr.json
+          severity: CRITICAL,HIGH
+          scanners: vuln
+          vuln-type: os,library
+          exit-code: "0"
+
+      - name: Full Trivy Scan
+        if: inputs.scan_mode == 'full'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy-full.json
+          severity: CRITICAL,HIGH
+          scanners: vuln
+          vuln-type: os,library
+          exit-code: "0"
+
+      - name: Ensure Trivy Reports Exist
+        if: always()
+        run: |
+          [ -f trivy-base.json ] || echo '{"Results":[]}' > trivy-base.json
+          [ -f trivy-pr.json ]   || echo '{"Results":[]}' > trivy-pr.json
+          [ -f trivy-full.json ] || echo '{"Results":[]}' > trivy-full.json
+
+      - name: Upload Trivy Reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-results
+          path: |
+            trivy-base.json
+            trivy-pr.json
+            trivy-full.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+# ============================================================
+# SEMGREP
+# ============================================================
+
+  semgrep:
+    name: Semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+
+    steps:
+
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Install Semgrep
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install semgrep
+          semgrep --version
+
+      - name: Run Semgrep - PR Changes
+        if: inputs.scan_mode == 'pr'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set +e
+
+          semgrep scan \
+            --config p/default \
+            --baseline-commit "${BASE_SHA}" \
+            --json \
+            --output semgrep-new-findings.json \
+            --metrics off
+
+          exit 0
+
+      - name: Run Semgrep - Full Repository
+        if: inputs.scan_mode == 'full'
+        run: |
+          set +e
+
+          semgrep scan \
+            --config p/default \
+            --json \
+            --output semgrep-full.json \
+            --metrics off
+
+          exit 0
+
+      - name: Ensure Semgrep Report Exists
+        if: always()
+        env:
+          SCAN_MODE: ${{ inputs.scan_mode }}
+        run: |
+          if [ "$SCAN_MODE" = "pr" ]; then
+            [ -f semgrep-new-findings.json ] || echo '{"results":[]}' > semgrep-new-findings.json
+          else
+            [ -f semgrep-full.json ] || echo '{"results":[]}' > semgrep-full.json
+          fi
+
+      - name: Upload Semgrep Report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: semgrep-results
+          path: |
+            semgrep-new-findings.json
+            semgrep-full.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+# ============================================================
+# SECURITY GATE
+#
+# The ONLY job that determines whether the PR security check
+# passes or fails.
+# ============================================================
+
+  security-gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    needs:
+      - gitleaks
+      - trivy
+      - semgrep
+
+    if: always()
+
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+
+      - name: Download Gitleaks Results
+        uses: actions/download-artifact@v8
+        with:
+          name: gitleaks-results
+          path: results/gitleaks
+
+      - name: Download Trivy Results
+        uses: actions/download-artifact@v8
+        with:
+          name: trivy-results
+          path: results/trivy
+
+      - name: Download Semgrep Results
+        uses: actions/download-artifact@v8
+        with:
+          name: semgrep-results
+          path: results/semgrep
+
+      - name: Analyze Security Findings
+        id: findings
+        env:
+          SCAN_MODE: ${{ inputs.scan_mode }}
+        run: |
+          set -euo pipefail
+
+          GITLEAKS_NEW=0
+          TRIVY_NEW=0
+          SEMGREP_NEW=0
+
+          if [ "$SCAN_MODE" = "pr" ]; then
+
+            GITLEAKS_FILE="results/gitleaks/gitleaks-new-findings.json"
+            if [ -f "$GITLEAKS_FILE" ]; then
+              GITLEAKS_NEW=$(jq 'length' "$GITLEAKS_FILE" 2>/dev/null || echo 0)
+            fi
+
+            # Trivy finding identity:
+            # Target + VulnerabilityID + PkgName + InstalledVersion
+            for side in base pr; do
+              jq -r '
+                [
+                  .Results[]? |
+                  . as $result |
+                  ($result.Vulnerabilities // [])[] |
+                  [$result.Target, .VulnerabilityID, .PkgName, .InstalledVersion] |
+                  @tsv
+                ] | unique | .[]
+              ' "results/trivy/trivy-${side}.json" 2>/dev/null \
+                | sort > "/tmp/trivy-${side}.txt" || true
+            done
+
+            comm -13 /tmp/trivy-base.txt /tmp/trivy-pr.txt > /tmp/trivy-new.txt
+            TRIVY_NEW=$(wc -l < /tmp/trivy-new.txt | tr -d ' ')
+
+            SEMGREP_FILE="results/semgrep/semgrep-new-findings.json"
+            if [ -f "$SEMGREP_FILE" ]; then
+              SEMGREP_NEW=$(jq '.results | length' "$SEMGREP_FILE" 2>/dev/null || echo 0)
+            fi
+
+          else
+
+            # Full scans report the entire existing backlog.
+            # They do NOT become merge gates.
+
+            GITLEAKS_FILE="results/gitleaks/gitleaks-full-report.json"
+            TRIVY_FILE="results/trivy/trivy-full.json"
+            SEMGREP_FILE="results/semgrep/semgrep-full.json"
+
+            if [ -f "$GITLEAKS_FILE" ]; then
+              GITLEAKS_NEW=$(jq 'length' "$GITLEAKS_FILE" 2>/dev/null || echo 0)
+            fi
+
+            if [ -f "$TRIVY_FILE" ]; then
+              TRIVY_NEW=$(jq '[.Results[]?.Vulnerabilities // []] | flatten | length' "$TRIVY_FILE" 2>/dev/null || echo 0)
+            fi
+
+            if [ -f "$SEMGREP_FILE" ]; then
+              SEMGREP_NEW=$(jq '.results | length' "$SEMGREP_FILE" 2>/dev/null || echo 0)
+            fi
+
+          fi
+
+          TOTAL_NEW=$((GITLEAKS_NEW + TRIVY_NEW + SEMGREP_NEW))
+
+          echo "Gitleaks findings: ${GITLEAKS_NEW}"
+          echo "Trivy findings: ${TRIVY_NEW}"
+          echo "Semgrep findings: ${SEMGREP_NEW}"
+          echo "Total findings: ${TOTAL_NEW}"
+
+          echo "gitleaks_new=${GITLEAKS_NEW}" >> "$GITHUB_OUTPUT"
+          echo "trivy_new=${TRIVY_NEW}" >> "$GITHUB_OUTPUT"
+          echo "semgrep_new=${SEMGREP_NEW}" >> "$GITHUB_OUTPUT"
+          echo "total_new=${TOTAL_NEW}" >> "$GITHUB_OUTPUT"
+
+      - name: Write Security Summary
+        env:
+          GITLEAKS_NEW: ${{ steps.findings.outputs.gitleaks_new }}
+          TRIVY_NEW: ${{ steps.findings.outputs.trivy_new }}
+          SEMGREP_NEW: ${{ steps.findings.outputs.semgrep_new }}
+          TOTAL_NEW: ${{ steps.findings.outputs.total_new }}
+          SCAN_MODE: ${{ inputs.scan_mode }}
+        run: |
+          {
+            echo "# 🛡️ Security Scan Results"
+            echo ""
+
+            if [ "$SCAN_MODE" = "pr" ]; then
+              echo "## New Findings Introduced by This PR"
+            else
+              echo "## Full Repository Scan"
+            fi
+
+            echo ""
+            echo "| Scanner | Findings |"
+            echo "|---|---:|"
+            echo "| Gitleaks | ${GITLEAKS_NEW} |"
+            echo "| Trivy | ${TRIVY_NEW} |"
+            echo "| Semgrep | ${SEMGREP_NEW} |"
+            echo "| **Total** | **${TOTAL_NEW}** |"
+            echo ""
+
+            if [ "$SCAN_MODE" = "pr" ]; then
+              if [ "$TOTAL_NEW" -eq 0 ]; then
+                echo "### ✅ No New Security Findings"
+                echo ""
+                echo "Existing findings are not treated as new findings."
+              else
+                echo "### ⚠️ New Security Findings Detected"
+                echo ""
+                echo "This PR introduced ${TOTAL_NEW} new security finding(s)."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on Pull Request
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@v9
+        env:
+          GITLEAKS_NEW: ${{ steps.findings.outputs.gitleaks_new }}
+          TRIVY_NEW: ${{ steps.findings.outputs.trivy_new }}
+          SEMGREP_NEW: ${{ steps.findings.outputs.semgrep_new }}
+          TOTAL_NEW: ${{ steps.findings.outputs.total_new }}
+          ENFORCE: ${{ inputs.enforce_new_findings }}
+        with:
+          script: |
+            const prNumber = context.payload.pull_request?.number;
+            if (!prNumber) {
+              return;
+            }
+
+            const gitleaks = Number(process.env.GITLEAKS_NEW || 0);
+            const trivy = Number(process.env.TRIVY_NEW || 0);
+            const semgrep = Number(process.env.SEMGREP_NEW || 0);
+            const total = Number(process.env.TOTAL_NEW || 0);
+            const enforce = process.env.ENFORCE === "true";
+
+            let body = `## 🛡️ Security Scan Results\n\n`;
+            body += `This scan evaluates **new findings introduced by this pull request**.\n\n`;
+            body += `| Scanner | New Findings |\n`;
+            body += `|---|---:|\n`;
+            body += `| 🔑 Gitleaks | ${gitleaks} |\n`;
+            body += `| 📦 Trivy | ${trivy} |\n`;
+            body += `| 🔍 Semgrep | ${semgrep} |\n`;
+            body += `| **Total** | **${total}** |\n\n`;
+
+            if (total === 0) {
+              body += `### ✅ No New Security Findings\n\n`;
+              body += `No new Gitleaks, Trivy, or Semgrep findings were detected.\n\n`;
+              body += enforce ? `**Security gate: PASSED**` : `**Security gate: WARN-ONLY**`;
+            } else {
+              body += `### ⚠️ New Security Findings Detected\n\n`;
+              body += `This pull request introduces **${total} new security finding(s)**.\n\n`;
+              if (enforce) {
+                body += `### ❌ Security Gate: FAILED\n\n`;
+                body += `New security findings must be resolved before this pull request can be merged.`;
+              } else {
+                body += `### ⚠️ Security Gate: WARN-ONLY\n\n`;
+                body += `New findings were detected, but this workflow is currently configured not to block merges.`;
+              }
+            }
+
+            body += `\n\n🤖 *Security scan results are available in the GitHub Actions run.*`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body
+            });
+
+      - name: Enforce Security Gate
+        if: inputs.scan_mode == 'pr' && inputs.enforce_new_findings == true
+        env:
+          TOTAL_NEW: ${{ steps.findings.outputs.total_new }}
+        run: |
+          if [ "$TOTAL_NEW" -gt 0 ]; then
+            echo "::error::Security gate failed: ${TOTAL_NEW} new security finding(s) were introduced."
+            exit 1
+          fi
+
+          echo "Security gate passed."
+          echo "No new security findings detected."
