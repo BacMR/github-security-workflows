@@ -1,5 +1,7 @@
 name: Org Security Scan
 
+run-name: "🛡️ ${{ inputs.org || 'Lebjawi-Tech' }} security scan — ${{ github.event_name == 'schedule' && 'scheduled' || format('by @{0}', github.actor) }}"
+
 on:
   workflow_dispatch:
     inputs:
