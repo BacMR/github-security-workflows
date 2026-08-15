@@ -5,9 +5,13 @@ CREATE TABLE IF NOT EXISTS scan_runs (
   id            bigserial PRIMARY KEY,
   github_run_id bigint,
   run_type      text        NOT NULL DEFAULT 'org',
+  org           text,
   started_at    timestamptz NOT NULL DEFAULT now(),
   finished_at   timestamptz
 );
+
+-- migration for databases created before the org column existed
+ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS org text;
 
 CREATE TABLE IF NOT EXISTS repo_scans (
   id             bigserial PRIMARY KEY,

@@ -3,6 +3,10 @@ name: Org Security Scan
 on:
   workflow_dispatch:
     inputs:
+      org:
+        description: "GitHub org to scan (any org the runner's gh account can access)"
+        required: false
+        default: "Lebjawi-Tech"
       test_repos:
         description: "Comma-separated repos to scan (owner/repo). Leave blank for all repos."
         required: false
@@ -12,11 +16,11 @@ on:
     - cron: "0 5 * * *"
 
 concurrency:
-  group: org-security-scan
+  group: org-security-scan-${{ inputs.org || 'Lebjawi-Tech' }}
   cancel-in-progress: false
 
 env:
-  ORG: Lebjawi-Tech
+  ORG: ${{ inputs.org || 'Lebjawi-Tech' }}
   SECSCAN_HOME: /opt/security-scanner
 
 # ============================================================
@@ -73,8 +77,8 @@ jobs:
           set -euo pipefail
           set -a; source "$SECSCAN_HOME/etc/db.env"; set +a
 
-          SCAN_RUN_ID=$("$SECSCAN_HOME/bin/psql" -qtA -v ON_ERROR_STOP=1 \
-            -c "INSERT INTO scan_runs (github_run_id, run_type) VALUES (${{ github.run_id }}, 'org') RETURNING id")
+          SCAN_RUN_ID=$("$SECSCAN_HOME/bin/psql" -qtA -v ON_ERROR_STOP=1 -v org="$ORG" \
+            -c "INSERT INTO scan_runs (github_run_id, run_type, org) VALUES (${{ github.run_id }}, 'org', :'org') RETURNING id")
 
           echo "Opened scan run ${SCAN_RUN_ID}"
           echo "scan_run_id=${SCAN_RUN_ID}" >> "$GITHUB_OUTPUT"
@@ -145,7 +149,10 @@ jobs:
           TRIVY_CACHE_DIR: /opt/security-scanner/cache/trivy
         run: |
           set -euo pipefail
+          # --offline-scan: never hit remote registries (Maven Central
+          # rate-limits scanners with 429s); the vuln DB is cached locally.
           trivy fs \
+            --offline-scan \
             --scanners vuln \
             --pkg-types os,library \
             --severity CRITICAL,HIGH \
@@ -209,7 +216,7 @@ jobs:
           PSQL="$SECSCAN_HOME/bin/psql"
 
           {
-            echo "# 🛡️ Org Security Scan — Run ${SCAN_RUN_ID}"
+            echo "# 🛡️ ${ORG} Security Scan — Run ${SCAN_RUN_ID}"
             echo ""
             echo "## Findings by Repository"
             echo ""
