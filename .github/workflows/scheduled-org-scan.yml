@@ -77,8 +77,13 @@ jobs:
           set -euo pipefail
           set -a; source "$SECSCAN_HOME/etc/db.env"; set +a
 
-          SCAN_RUN_ID=$("$SECSCAN_HOME/bin/psql" -qtA -v ON_ERROR_STOP=1 -v org="$ORG" \
-            -c "INSERT INTO scan_runs (github_run_id, run_type, org) VALUES (${{ github.run_id }}, 'org', :'org') RETURNING id")
+          # psql only interpolates :'var' on stdin/-f input, not with -c
+          SCAN_RUN_ID=$("$SECSCAN_HOME/bin/psql" -qtA -v ON_ERROR_STOP=1 -v org="$ORG" <<'SQL'
+          INSERT INTO scan_runs (github_run_id, run_type, org)
+          VALUES (${{ github.run_id }}, 'org', :'org')
+          RETURNING id;
+          SQL
+          )
 
           echo "Opened scan run ${SCAN_RUN_ID}"
           echo "scan_run_id=${SCAN_RUN_ID}" >> "$GITHUB_OUTPUT"
@@ -225,7 +230,8 @@ jobs:
             echo ""
             echo "| Repository | Gitleaks | Trivy | Semgrep | Total |"
             echo "|---|---:|---:|---:|---:|"
-            "$PSQL" -qtA -F'|' -v matrix="$REPO_MATRIX" -c "
+            QUERY_FILE=$(mktemp)
+            cat > "$QUERY_FILE" <<SQL
               WITH per_repo AS (
                 SELECT repository,
                        coalesce(sum(findings_count) FILTER (WHERE scanner = 'gitleaks'), 0) AS gitleaks,
@@ -244,8 +250,11 @@ jobs:
                           ELSE p.total::text END
               FROM jsonb_array_elements_text(:'matrix'::jsonb) AS m(repo)
               LEFT JOIN per_repo p ON p.repository = m.repo
-              ORDER BY coalesce(p.total, -1) DESC, m.repo
-            " | awk -F'|' '{printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5}'
+              ORDER BY coalesce(p.total, -1) DESC, m.repo;
+          SQL
+            "$PSQL" -qtA -F'|' -v matrix="$REPO_MATRIX" -f "$QUERY_FILE" \
+              | awk -F'|' '{printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5}'
+            rm -f "$QUERY_FILE"
             echo ""
             TOTAL=$("$PSQL" -qtA -c "
               SELECT coalesce(sum(findings_count), 0)
