@@ -119,6 +119,7 @@ jobs:
         run: echo "$SECSCAN_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Sync Repository (Cached Clone)
+        id: sync
         run: |
           set -euo pipefail
           export GH_TOKEN="$(gh auth token)"
@@ -132,17 +133,26 @@ jobs:
           if [ -d "$CACHE/.git" ]; then
             echo "Updating cached clone"
             git "${GIT_AUTH[@]}" -C "$CACHE" fetch origin --prune --tags --force
-            git "${GIT_AUTH[@]}" -C "$CACHE" remote set-head origin --auto
-            DEFAULT=$(git -C "$CACHE" symbolic-ref --short refs/remotes/origin/HEAD | sed 's|^origin/||')
-            git -C "$CACHE" checkout -f "$DEFAULT"
-            git -C "$CACHE" reset --hard "origin/$DEFAULT"
           else
             echo "Cloning fresh (full history)"
             mkdir -p "$(dirname "$CACHE")"
             git "${GIT_AUTH[@]}" clone "https://github.com/$REPO.git" "$CACHE"
           fi
 
+          # Empty repos (no commits) have no remote HEAD — skip scanning.
+          if git "${GIT_AUTH[@]}" -C "$CACHE" remote set-head origin --auto 2>/dev/null \
+             && DEFAULT=$(git -C "$CACHE" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||') \
+             && [ -n "$DEFAULT" ]; then
+            git -C "$CACHE" checkout -f "$DEFAULT"
+            git -C "$CACHE" reset --hard "origin/$DEFAULT"
+            echo "has_code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Repository is empty — recording zero findings"
+            echo "has_code=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run Gitleaks (Full History)
+        if: steps.sync.outputs.has_code == 'true'
         run: |
           set -euo pipefail
           gitleaks git "$SECSCAN_HOME/cache/repos/$REPO" \
@@ -152,6 +162,7 @@ jobs:
             --exit-code 0
 
       - name: Run Trivy
+        if: steps.sync.outputs.has_code == 'true'
         env:
           TRIVY_CACHE_DIR: /opt/security-scanner/cache/trivy
         run: |
@@ -169,6 +180,7 @@ jobs:
             "$SECSCAN_HOME/cache/repos/$REPO"
 
       - name: Run Semgrep
+        if: steps.sync.outputs.has_code == 'true'
         run: |
           set +e
           semgrep scan \
@@ -184,6 +196,11 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          # Empty/skipped scans get empty reports so every repo shows up
+          # in the summary with an explicit zero.
+          [ -f "$RUNNER_TEMP/gitleaks.json" ] || echo '[]'             > "$RUNNER_TEMP/gitleaks.json"
+          [ -f "$RUNNER_TEMP/trivy.json" ]    || echo '{"Results":[]}' > "$RUNNER_TEMP/trivy.json"
+          [ -f "$RUNNER_TEMP/semgrep.json" ]  || echo '{"results":[]}' > "$RUNNER_TEMP/semgrep.json"
           secscan-ingest "$SCAN_RUN_ID" "$REPO" gitleaks "$RUNNER_TEMP/gitleaks.json"
           secscan-ingest "$SCAN_RUN_ID" "$REPO" trivy    "$RUNNER_TEMP/trivy.json"
           secscan-ingest "$SCAN_RUN_ID" "$REPO" semgrep  "$RUNNER_TEMP/semgrep.json"
