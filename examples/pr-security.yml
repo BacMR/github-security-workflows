@@ -16,4 +16,4 @@ jobs:
     uses: BacMR/github-security-workflows/.github/workflows/security-scan.yml@main
     with:
       scan_mode: pr
-      enforce_new_findings: false  # flip to true to block merges on new findings
+      enforce_new_findings: true
