@@ -9,4 +9,4 @@ jobs:
     uses: BacMR/github-security-workflows/.github/workflows/security-scan.yml@main
     with:
       scan_mode: pr
-      enforce_new_findings: false
+      enforce_new_findings: true
