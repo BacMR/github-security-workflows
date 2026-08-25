@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Installs a GitHub Actions self-hosted runner for the Lebjawi-Tech org
+# Installs a GitHub Actions self-hosted runner for the BacMR org
 # under /opt/security-scanner/runner and registers it as a systemd
 # service.
 #
@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-ORG="${ORG:-Lebjawi-Tech}"
+ORG="${ORG:-BacMR}"
 BASE="${SECSCAN_HOME:-/opt/security-scanner}/runner"
 RUNNER_NAME="${RUNNER_NAME:-vps-secscan}"
 RUNNER_USER="${RUNNER_USER:-$(id -un)}"
