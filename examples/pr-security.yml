@@ -1,4 +1,4 @@
-# Copy this file into any Lebjawi-Tech repo as
+# Copy this file into any BacMR repo as
 # .github/workflows/pr-security.yml to get PR-time security gating.
 
 name: PR Security
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   security:
-    uses: Lebjawi-Tech/github-security-workflows/.github/workflows/security-scan.yml@main
+    uses: BacMR/github-security-workflows/.github/workflows/security-scan.yml@main
     with:
       scan_mode: pr
       enforce_new_findings: false  # flip to true to block merges on new findings

@@ -1,6 +1,6 @@
 name: Org Security Scan
 
-run-name: "🛡️ ${{ inputs.org || 'Lebjawi-Tech' }} security scan — ${{ github.event_name == 'schedule' && 'scheduled' || format('by @{0}', github.actor) }}"
+run-name: "🛡️ ${{ inputs.org || 'BacMR' }} security scan — ${{ github.event_name == 'schedule' && 'scheduled' || format('by @{0}', github.actor) }}"
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
       org:
         description: "GitHub org to scan (any org the runner's gh account can access)"
         required: false
-        default: "Lebjawi-Tech"
+        default: "BacMR"
       test_repos:
         description: "Comma-separated repos to scan (owner/repo). Leave blank for all repos."
         required: false
@@ -18,11 +18,11 @@ on:
     - cron: "0 5 * * *"
 
 concurrency:
-  group: org-security-scan-${{ inputs.org || 'Lebjawi-Tech' }}
+  group: org-security-scan-${{ inputs.org || 'BacMR' }}
   cancel-in-progress: false
 
 env:
-  ORG: ${{ inputs.org || 'Lebjawi-Tech' }}
+  ORG: ${{ inputs.org || 'BacMR' }}
   SECSCAN_HOME: /opt/security-scanner
 
 # ============================================================

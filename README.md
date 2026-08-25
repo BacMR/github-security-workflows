@@ -1,6 +1,6 @@
-# Lebjawi-Tech Security Workflows
+# BacMR Security Workflows
 
-Org-wide security scanning for Lebjawi-Tech: Gitleaks (secrets), Trivy
+Org-wide security scanning for BacMR: Gitleaks (secrets), Trivy
 (dependency/OS vulnerabilities, CRITICAL+HIGH), and Semgrep (SAST).
 
 Two execution paths:
