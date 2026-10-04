@@ -1,6 +1,40 @@
 version: 2
+
+# github-security-workflows is the provider of the reusable security-scan workflow
+# that all ten BacMR repos call. It ships only workflow YAML and shell -- there is
+# no package manifest of any kind -- so "github-actions" is the complete and
+# correct ecosystem list, exactly as before.
+#
+# This config keeps that single ecosystem and only adds the org-standard noise
+# controls that were missing: grouped minor/patch updates, an explicit PR limit,
+# and a 7-day cooldown. Nothing here is loosened.
+#
+# The cooldown is deliberately kept even though this is the security provider: it
+# is a supply-chain quarantine on third-party actions (a compromised action
+# release is a far likelier failure mode than a 7-day-stale one), and the actual
+# scanner versions are pinned in the workflow itself (e.g. GITLEAKS_VERSION),
+# not resolved by Dependabot.
+#
+# NOTE: this repo's default branch is "main", not "dev" like the other nine, so
+# there is no target-branch override -- Dependabot targets the default branch.
+# That difference is intentional: every repo's pr-security.yml pins
+# "...security-scan.yml@main", so renaming or retargeting this branch would break
+# the security gate across the whole org.
+#
+# Staggered schedule: Tuesday 09:00, offset from web-platform's Tuesday 06:00 slot.
 updates:
-  - package-ecosystem: github-actions
-    directory: /
+  - package-ecosystem: "github-actions"
+    directory: "/"
     schedule:
-      interval: weekly
+      interval: "weekly"
+      day: "tuesday"
+      time: "09:00"
+      timezone: "Africa/Nouakchott"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
