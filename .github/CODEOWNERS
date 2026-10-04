@@ -1,0 +1,22 @@
+# Code owners for BacMR/github-security-workflows
+#
+# Mirrors BacMR/backend's CODEOWNERS so ownership is uniform across the org.
+#
+# Scope of this file today: it routes review requests automatically and records
+# who owns what. It is NOT currently a merge gate -- the `production` ruleset on
+# this repo sets require_code_owner_review=false on purpose.
+#
+# Why that is deliberate: GitHub does not let an author approve their own PR.
+# With a single code owner, requiring code-owner review blocks every PR that
+# owner opens (this is exactly what blocks BacMR/backend PR #103 today). Turning
+# the gate on is a one-line ruleset change once a second owner exists -- add them
+# below first, then flip require_code_owner_review.
+
+# Default owner for everything in the repo.
+*   @msoueilem
+
+# CI/CD, deploy and security surfaces -- called out explicitly so that a change
+# here is never auto-approved by a broader rule added later.
+/.github/            @msoueilem
+/deploy/             @msoueilem
+/.github/CODEOWNERS  @msoueilem
