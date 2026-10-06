@@ -6,7 +6,12 @@ permissions:
   issues: write
 jobs:
   security:
-    uses: BacMR/github-security-workflows/.github/workflows/security-scan.yml@main
+    # Local `./` reference, not `@main`: this repo must gate its own PRs with the
+    # version of security-scan.yml *in the PR*, otherwise a change to that file can
+    # only be validated after it is already merged. Consumer repos keep using
+    # `@main` (see examples/pr-security.yml). The rendered required-check name is
+    # unchanged either way: `security / Security Gate`.
+    uses: ./.github/workflows/security-scan.yml
     with:
       scan_mode: pr
       enforce_new_findings: true
