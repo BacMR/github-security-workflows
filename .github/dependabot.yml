@@ -34,7 +34,19 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      minor-and-patch:
+      # Grouped by update-type on purpose. dependabot/fetch-metadata reports the
+      # HIGHEST semver change across a whole PR, so one major anywhere inside a
+      # mixed group makes the entire PR unclassifiable and the Tier 1 auto-merge
+      # workflow refuses it. Splitting patch from minor keeps every grouped PR
+      # cleanly one update-type, and leaves majors as individual PRs for review.
+      # This is load-bearing for auto-merge, not cosmetic.
+      #
+      # `update-types` here takes the SHORT forms (patch/minor/major). The
+      # `version-update:semver-*` spelling belongs to `ignore`/`allow` only --
+      # using it in a group is an invalid config.
+      patch:
+        update-types:
+          - "patch"
+      minor:
         update-types:
           - "minor"
-          - "patch"
