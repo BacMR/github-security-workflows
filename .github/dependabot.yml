@@ -26,8 +26,25 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "tuesday"
+    # Monthly, not weekly. At ~29 billed Actions minutes per dependency PR and 19
+    # ecosystem entries across the org, a weekly cadence with the patch/minor
+    # split projected to roughly 4,500 min/month against a 3,000-minute
+    # allowance. With spending caps at $0 an exhausted allowance does not
+    # produce a bill, it stops Actions — and a required status check that cannot
+    # run never reports, which blocks every PR in the org. CI cost is therefore
+    # a correctness constraint here, not a budget nicety.
+    #
+    # This does NOT delay security fixes: `schedule.interval` governs version
+    # updates only. Dependabot security updates are advisory-driven and fire
+    # independently of this schedule, and grouped `applies-to` defaults to
+    # version-updates, so a CVE fix still arrives as its own PR immediately.
+    #
+    # Tradeoff accepted: the old weekday stagger (one repo per day) is gone,
+    # because `schedule.day` applies to weekly only — every entry now runs on the
+    # 1st, spaced just by `time`. If that day-1 spike becomes a problem, the fix
+    # is `interval: "cron"` with a `cronjob:` expression, which can spread
+    # entries across days of the month and keep the 4x saving.
+      interval: "monthly"
       time: "09:00"
       timezone: "Africa/Nouakchott"
     open-pull-requests-limit: 5
