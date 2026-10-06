@@ -1,8 +1,54 @@
 name: Security Scan
 
 # Reusable workflow for per-repo scanning. Call it from a repo's own
-# workflow (see examples/pr-security.yml). Runs on GitHub-hosted
-# runners so untrusted PR code never executes on the VPS.
+# workflow (see examples/pr-security.yml).
+#
+# WHERE THIS RUNS  (changed 2026-10-06 — this used to say "GitHub-hosted runners so
+# untrusted PR code never executes on the VPS", so here is the reasoning in full)
+#
+#   Every job now runs on `[self-hosted, bacmr-ci-vps]`: the containerised ephemeral
+#   runner at /opt/bacmr-ci-runner on the VPS.
+#
+#   WHY IT HAD TO MOVE. This workflow produces `security / Security Gate`, which the
+#   org ruleset requires on dev and main in every repo. In October 2026 the org burned
+#   3,618 GitHub-hosted minutes against a 3,000-minute allowance in six days and the
+#   Actions budget hit `prevent_further_usage`. GitHub-hosted jobs then stop being
+#   *queued* — they come back in ~2 seconds with no runner and zero steps, which GitHub
+#   reports as `conclusion: failure`. A required check that cannot start is
+#   indistinguishable from a failing one, so every PR in every repo froze. Hosting the
+#   gate on a runner the org's billing cannot switch off is what unfreezes them.
+#   Self-hosted minutes are not metered on private repos, and all BacMR repos are private.
+#
+#   WHY IT IS DEFENSIBLE, not just expedient:
+#     1. These three scanners never execute the scanned repo's code. Gitleaks reads git
+#        history, Trivy reads the filesystem and lockfiles, Semgrep parses source. None
+#        of them runs `npm install`, `uv sync`, or any repo script — the only install in
+#        this file is `pip install semgrep`, the scanner itself. The "untrusted PR code
+#        executes on the VPS" risk the old comment guarded against does not apply to
+#        this particular workflow. It very much does apply to the repo CI workflows that
+#        build and test dependency trees, which is why those got the dind isolation first.
+#     2. The runner is not the host. Jobs run in a container whose Docker access points
+#        at a Docker-in-Docker sidecar, not the host daemon — verified: the in-job daemon
+#        lists 0 containers while the host runs 46 (production Postgres for five tenants,
+#        Zitadel, Vaultwarden, Infisical). It is deliberately NOT the host-level
+#        `vps-secscan` runner, which has no such isolation.
+#     3. EPHEMERAL=true: the runner de-registers and exits after every single job, so no
+#        scanned repo's checkout, token, or artifact survives into the next repo's scan.
+#     4. All BacMR repos are private and the Default runner group has
+#        allows_public_repositories=false, so there is no fork-PR path onto this runner.
+#
+#   RESIDUAL RISK, stated plainly: dind needs `privileged: true`, so the isolation win is
+#   production invisibility rather than escape-proofing; and a self-hosted runner can read
+#   whatever secrets a workflow hands it. This workflow is handed only the default
+#   `GITHUB_TOKEN`, scoped by the `permissions:` blocks below.
+#
+#   COST OF THE MOVE: the runner accepts ONE job at a time, so these four jobs now run
+#   sequentially instead of in parallel, plus ~15s of ephemeral re-registration each.
+#   Roughly 2.5 min wall clock against ~1.4 min of real work spread over 4 parallel
+#   hosted jobs. Worth noting that those 4 sub-minute jobs were billed as 4.3 minutes per
+#   run (GitHub rounds every job up to a whole minute) — 1,180 minutes, 32% of all org
+#   Actions minutes in October, for ~80 seconds of actual scanning. Consolidating the
+#   three scanners into one job is the obvious follow-up and would cut the wall clock too.
 
 on:
   workflow_call:
@@ -30,7 +76,7 @@ jobs:
 
   gitleaks:
     name: Gitleaks
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, bacmr-ci-vps]
     timeout-minutes: 10
 
     permissions:
@@ -130,7 +176,7 @@ jobs:
 
   trivy:
     name: Trivy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, bacmr-ci-vps]
     timeout-minutes: 15
 
     permissions:
@@ -220,7 +266,7 @@ jobs:
 
   semgrep:
     name: Semgrep
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, bacmr-ci-vps]
     timeout-minutes: 15
 
     permissions:
@@ -304,7 +350,7 @@ jobs:
 
   security-gate:
     name: Security Gate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, bacmr-ci-vps]
     timeout-minutes: 10
 
     needs:
