@@ -3,52 +3,54 @@ name: Security Scan
 # Reusable workflow for per-repo scanning. Call it from a repo's own
 # workflow (see examples/pr-security.yml).
 #
-# WHERE THIS RUNS  (changed 2026-10-06 — this used to say "GitHub-hosted runners so
-# untrusted PR code never executes on the VPS", so here is the reasoning in full)
+# WHERE THIS RUNS  (changed 2026-10-16 — back to GitHub-hosted; see history below)
 #
-#   Every job now runs on `[self-hosted, bacmr-ci-vps]`: the containerised ephemeral
-#   runner at /opt/bacmr-ci-runner on the VPS.
+#   Every job runs on `ubuntu-latest`.
 #
-#   WHY IT HAD TO MOVE. This workflow produces `security / Security Gate`, which the
-#   org ruleset requires on dev and main in every repo. In October 2026 the org burned
-#   3,618 GitHub-hosted minutes against a 3,000-minute allowance in six days and the
-#   Actions budget hit `prevent_further_usage`. GitHub-hosted jobs then stop being
-#   *queued* — they come back in ~2 seconds with no runner and zero steps, which GitHub
-#   reports as `conclusion: failure`. A required check that cannot start is
-#   indistinguishable from a failing one, so every PR in every repo froze. Hosting the
-#   gate on a runner the org's billing cannot switch off is what unfreezes them.
-#   Self-hosted minutes are not metered on private repos, and all BacMR repos are private.
+#   WHY IT MOVED BACK. On 2026-10-06 all four jobs were moved to
+#   `[self-hosted, bacmr-ci-vps]`, the containerised ephemeral runner at
+#   /opt/bacmr-ci-runner on the VPS. That move existed for exactly one reason: cost.
+#   October 2026 burned 3,494 hosted minutes against a 3,000-minute allowance with
+#   spending caps at $0, so Actions *stopped* rather than billed. Because the org
+#   ruleset requires `security / Security Gate` on dev and main in every repo, a gate
+#   that cannot run blocks every PR in the org — so the gate was moved to a runner the
+#   billing switch could not reach.
 #
-#   WHY IT IS DEFENSIBLE, not just expedient:
-#     1. These three scanners never execute the scanned repo's code. Gitleaks reads git
-#        history, Trivy reads the filesystem and lockfiles, Semgrep parses source. None
-#        of them runs `npm install`, `uv sync`, or any repo script — the only install in
-#        this file is `pip install semgrep`, the scanner itself. The "untrusted PR code
-#        executes on the VPS" risk the old comment guarded against does not apply to
-#        this particular workflow. It very much does apply to the repo CI workflows that
-#        build and test dependency trees, which is why those got the dind isolation first.
-#     2. The runner is not the host. Jobs run in a container whose Docker access points
-#        at a Docker-in-Docker sidecar, not the host daemon — verified: the in-job daemon
-#        lists 0 containers while the host runs 46 (production Postgres for five tenants,
-#        Zitadel, Vaultwarden, Infisical). It is deliberately NOT the host-level
-#        `vps-secscan` runner, which has no such isolation.
-#     3. EPHEMERAL=true: the runner de-registers and exits after every single job, so no
-#        scanned repo's checkout, token, or artifact survives into the next repo's scan.
-#     4. All BacMR repos are private and the Default runner group has
-#        allows_public_repositories=false, so there is no fork-PR path onto this runner.
+#   The org is now on GitHub Enterprise. The minutes constraint that justified the move
+#   is gone, and with it the only argument for self-hosting this workflow.
 #
-#   RESIDUAL RISK, stated plainly: dind needs `privileged: true`, so the isolation win is
-#   production invisibility rather than escape-proofing; and a self-hosted runner can read
-#   whatever secrets a workflow hands it. This workflow is handed only the default
-#   `GITHUB_TOKEN`, scoped by the `permissions:` blocks below.
+#   What the arrangement cost in the meantime — two org-wide outages, both of which
+#   presented at the merge gate as ordinary check failures:
+#     1. ~29 hours. The runner's `ACCESS_TOKEN` was empty, so the container held only a
+#        one-hour registration token. `EPHEMERAL` re-registers after every job, so the
+#        first job past the hour 404'd, and `restart: unless-stopped` replayed the dead
+#        token 1,756 times.
+#     2. Multi-day. The runner deregistered entirely while eight repos still targeted
+#        its label. Jobs with no matching runner queue indefinitely and are eventually
+#        cancelled — and a `cancelled` required check is indistinguishable from a
+#        failing one when you are deciding whether to merge.
+#   Nothing alerted on either. One non-redundant runner gated 11 repos.
 #
-#   COST OF THE MOVE: the runner accepts ONE job at a time, so these four jobs now run
-#   sequentially instead of in parallel, plus ~15s of ephemeral re-registration each.
-#   Roughly 2.5 min wall clock against ~1.4 min of real work spread over 4 parallel
-#   hosted jobs. Worth noting that those 4 sub-minute jobs were billed as 4.3 minutes per
-#   run (GitHub rounds every job up to a whole minute) — 1,180 minutes, 32% of all org
-#   Actions minutes in October, for ~80 seconds of actual scanning. Consolidating the
-#   three scanners into one job is the obvious follow-up and would cut the wall clock too.
+#   The pre-2026-10-06 security rationale also returns intact, and it is worth restating
+#   because it is the stronger reason to stay here: on GitHub-hosted runners, untrusted
+#   PR code never executes on the VPS. These three scanners do not run the scanned
+#   repo's code (Gitleaks reads git history, Trivy reads the filesystem and lockfiles,
+#   Semgrep parses source), so self-hosting them was defensible — but "defensible" is a
+#   worse place to be than "not a question at all", for a workflow that runs against
+#   every PR in every repo including dependency bumps.
+#
+#   The self-hosted stack is documented at https://vps-setup.bacmr.com (self-hosted
+#   runner page) so it can be revived if the org ever returns to a minutes-constrained
+#   plan. The open question for that day is redundancy. `bacmr-vps-deploy` and
+#   `vps-secscan` are unaffected and stay self-hosted: they run our own code, not
+#   third-party dependency trees, and the deploy runner keeps `VPS_SSH_KEY` off hosted
+#   runners.
+#
+#   COST NOTE, for whoever revisits this: these four jobs do ~80 seconds of real
+#   scanning but bill as ~4.3 minutes per run, because GitHub rounds every job up to a
+#   whole minute — 1,180 minutes, 32% of all org Actions minutes in October 2026.
+#   Consolidating the three scanners into one job is the obvious optimisation and would
+#   cut both the bill and the wall clock. That, not self-hosting, is the right lever.
 
 on:
   workflow_call:
@@ -76,7 +78,7 @@ jobs:
 
   gitleaks:
     name: Gitleaks
-    runs-on: [self-hosted, bacmr-ci-vps]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
 
     permissions:
@@ -176,7 +178,7 @@ jobs:
 
   trivy:
     name: Trivy
-    runs-on: [self-hosted, bacmr-ci-vps]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
 
     permissions:
@@ -266,7 +268,7 @@ jobs:
 
   semgrep:
     name: Semgrep
-    runs-on: [self-hosted, bacmr-ci-vps]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
 
     permissions:
@@ -350,7 +352,7 @@ jobs:
 
   security-gate:
     name: Security Gate
-    runs-on: [self-hosted, bacmr-ci-vps]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
 
     needs:
