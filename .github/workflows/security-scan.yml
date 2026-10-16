@@ -78,7 +78,21 @@ jobs:
 
   gitleaks:
     name: Gitleaks
-    runs-on: ubuntu-latest
+    # PINNED deliberately, not `ubuntu-latest`. GitHub flips the `ubuntu-latest`
+    # alias to Ubuntu 26 on 2026-10-19, which would change the OS, the default
+    # Python/Node and the preinstalled tooling underneath a REQUIRED check without
+    # anyone choosing it. This org's failure mode is "green until the environment
+    # moves", so an unannounced OS swap under the check that gates every merge is a
+    # freeze risk with a date on it.
+    #
+    # The trade: pinning gives up "automatically current" in exchange for "changes
+    # only when we choose". For a required check that is the right way round.
+    #
+    # FOLLOW-UP, left deliberately visible rather than buried: somebody must move
+    # this to `ubuntu-26.04` on purpose, test it, and land it as its own change.
+    # This is a pin, not a decision to sit on 24.04 forever -- revisit it, do not
+    # let it fossilise.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     permissions:
@@ -178,7 +192,9 @@ jobs:
 
   trivy:
     name: Trivy
-    runs-on: ubuntu-latest
+    # Pinned for the same reason as the job above -- see that comment. Not
+    # `ubuntu-latest`: the alias becomes Ubuntu 26 on 2026-10-19.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     permissions:
@@ -268,7 +284,9 @@ jobs:
 
   semgrep:
     name: Semgrep
-    runs-on: ubuntu-latest
+    # Pinned for the same reason as the job above -- see that comment. Not
+    # `ubuntu-latest`: the alias becomes Ubuntu 26 on 2026-10-19.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     permissions:
@@ -352,7 +370,9 @@ jobs:
 
   security-gate:
     name: Security Gate
-    runs-on: ubuntu-latest
+    # Pinned for the same reason as the job above -- see that comment. Not
+    # `ubuntu-latest`: the alias becomes Ubuntu 26 on 2026-10-19.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     needs:
