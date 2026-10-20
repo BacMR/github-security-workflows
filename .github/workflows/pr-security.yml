@@ -15,3 +15,29 @@ jobs:
     with:
       scan_mode: pr
       enforce_new_findings: true
+
+  # Aggregate check for the org ruleset: every repo requires a check named exactly
+  # `gate`. Every PR-triggered job of this repo must be listed in `needs`, and each
+  # must have succeeded. `if: always()` makes the gate report even when a needed job
+  # fails or is cancelled, instead of leaving the check missing. Add new PR jobs to
+  # `needs` here. dependabot-auto-merge.yml is a separate workflow whose job is skipped
+  # for human PRs, so it cannot be a `needs` here and is not covered by this gate.
+  gate:
+    name: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - security
+    permissions:
+      contents: read
+    steps:
+      - name: Require every PR job to succeed
+        env:
+          SECURITY_RESULT: ${{ needs.security.result }}
+        run: |
+          if [ "$SECURITY_RESULT" != "success" ]; then
+            echo "::error::job 'security' finished with result '$SECURITY_RESULT' (expected 'success')"
+            exit 1
+          fi
+          echo "job 'security': success"
