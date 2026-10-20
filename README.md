@@ -39,6 +39,10 @@ The rendered check is named **`security / Security Gate`**. The org ruleset
 `protect-dev-and-main` requires that check on `dev` and `main` in every repo,
 so a repo without this workflow cannot merge any PR.
 
+The aggregate **`gate`** job (in `pr-security.yml`) is the check the org ruleset requires
+in every repo; it succeeds only when every job it `needs` succeeded. Add new PR jobs to its
+`needs` list.
+
 Inputs of the reusable workflow:
 
 | Input | Default | Meaning |
