@@ -142,6 +142,11 @@ jobs:
           printf '#!/bin/sh\necho "simulated gitleaks crash" >&2\nexit 1\n' | sudo tee /usr/local/bin/gitleaks >/dev/null
           sudo chmod +x /usr/local/bin/gitleaks
 
+      # Remove any same-named file that came with the checkout, so a file committed
+      # in the target repo can never stand in for the report of a crashed scanner.
+      - name: Remove Stale Gitleaks Reports
+        run: rm -f gitleaks-new-findings.json gitleaks-full-report.json gitleaks-status.json
+
       # ======================================================
       # PR SCAN
       # ======================================================
@@ -275,6 +280,11 @@ jobs:
       # PR MODE — scan BASE and PR separately;
       # the security-gate job compares the results.
       # ======================================================
+
+      # Remove any same-named file that came with the checkout, so a file committed
+      # in the target repo can never stand in for the report of a crashed scanner.
+      - name: Remove Stale Trivy Reports
+        run: rm -f trivy-base.json trivy-pr.json trivy-full.json trivy-status.json
 
       - name: Create Base Worktree
         if: inputs.scan_mode == 'pr'
@@ -420,7 +430,10 @@ jobs:
       - name: Install Semgrep
         run: |
           python -m pip install --upgrade pip
-          python -m pip install semgrep
+          # PINNED: the version verified on Python 3.12 (issue #14). Dependabot does
+          # not track pip installs inside workflow `run:` steps, so bump this
+          # deliberately and check the gate's integrity step reports semgrep ok.
+          python -m pip install semgrep==1.182.1
           semgrep --version
 
       - name: Simulate Semgrep Crash (test only)
@@ -431,6 +444,11 @@ jobs:
           printf '#!/bin/sh\necho "simulated semgrep crash" >&2\nexit 2\n' > "$RUNNER_TEMP/simulated-crash/semgrep"
           chmod +x "$RUNNER_TEMP/simulated-crash/semgrep"
           echo "$RUNNER_TEMP/simulated-crash" >> "$GITHUB_PATH"
+
+      # Remove any same-named file that came with the checkout, so a file committed
+      # in the target repo can never stand in for the report of a crashed scanner.
+      - name: Remove Stale Semgrep Reports
+        run: rm -f semgrep-new-findings.json semgrep-full.json semgrep-status.json
 
       - name: Run Semgrep - PR Changes
         id: semgrep_pr
@@ -549,6 +567,15 @@ jobs:
       issues: write
 
     steps:
+
+      - name: Validate simulate_crash Input
+        env:
+          SIMULATE_CRASH: ${{ inputs.simulate_crash }}
+        run: |
+          case "$SIMULATE_CRASH" in
+            none|gitleaks|trivy|semgrep) echo "simulate_crash=${SIMULATE_CRASH}" ;;
+            *) echo "::error::Unknown simulate_crash value '${SIMULATE_CRASH}' (expected none|gitleaks|trivy|semgrep)"; exit 1 ;;
+          esac
 
       - name: Download Gitleaks Results
         uses: actions/download-artifact@v8
