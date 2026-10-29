@@ -17,6 +17,12 @@ on:
   schedule:
     - cron: "0 5 * * *"
 
+# Least privilege: no job uses GITHUB_TOKEN. Every gh/git call authenticates
+# with the self-hosted runner's own gh login (`gh auth token`), there is no
+# checkout, SARIF upload, dispatch or issue write, and results go to the
+# secscan Postgres DB. So the workflow token gets no scopes at all.
+permissions: {}
+
 concurrency:
   group: org-security-scan-${{ inputs.org || 'BacMR' }}
   cancel-in-progress: false
