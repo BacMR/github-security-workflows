@@ -47,8 +47,10 @@ SHA.
 2. To prove a scanner still detects, push a throwaway commit on the branch with a
    known-bad sample (fake secret, vulnerable manifest, Semgrep-matching code), confirm
    the gate fails with `enforce_new_findings: true`, then drop the commit.
-3. Remember the known gap in `README.md`: a crashed scanner is read as zero findings,
-   so confirm each scanner job actually produced its report.
+3. Read the gate's **Check Scanner Integrity** step: all three scanners must be `ok`.
+   Until `fail_closed` defaults to `true` (see README rollout plan) a crashed scanner
+   only warns. To re-prove fail-closed, use the `simulate_crash` throwaway-commit
+   procedure in `README.md`; never set `simulate_crash` in a consumer repo.
 4. Toolchain/DB changes: `deploy/install-tools.sh` (idempotent) on the VPS; schema in
    `db/schema.sql`; ingestion in `scripts/secscan-ingest.sh`. Check the next daily run
    in `scan_runs` afterwards.
