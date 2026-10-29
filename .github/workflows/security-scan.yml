@@ -407,10 +407,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      # PINNED, not "3.x" (found via issue #14's integrity check, 2026-10-29): once
+      # "3.x" resolved to Python 3.15, semgrep 1.182 crashed on every run
+      # ("semgrep-core exited with -11" / "exited with 1") in knowledge, api-gateway,
+      # web-platform and this repo, and the old gate read the crash as zero findings.
+      # 3.12 is verified locally with the same semgrep version. Move it on purpose.
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.x"
+          python-version: "3.12"
 
       - name: Install Semgrep
         run: |
