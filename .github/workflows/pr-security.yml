@@ -16,8 +16,8 @@ jobs:
       scan_mode: pr
       enforce_new_findings: true
       # Rollout step 2 of issue #14: this repo is the first adopter of fail_closed.
-      fail_closed: 
-      simulate_crash: trivy false
+      fail_closed: true
+      simulate_crash: trivy
 
   # Aggregate check for the org ruleset: every repo requires a check named exactly
   # `gate`. Every PR-triggered job of this repo must be listed in `needs`, and each
