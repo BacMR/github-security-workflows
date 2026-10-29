@@ -49,6 +49,8 @@ Inputs of the reusable workflow:
 |---|---|---|
 | `scan_mode` | `pr` | `pr` compares the PR against its base; `full` scans the whole tree (used by the daily scan) |
 | `enforce_new_findings` | `false` | when `true`, the gate job fails if the PR introduced new findings |
+| `fail_closed` | `false` | when `true`, the gate job fails unless **all three scanners ran cleanly** (see "Scanner integrity" below). When `false`, decisions are unchanged but every run warns about any scanner that did not run cleanly |
+| `simulate_crash` | `none` | **test only** — `gitleaks`, `trivy` or `semgrep` deliberately breaks that scanner to prove `fail_closed`. Never set it in a consumer repo |
 
 ## How the gate decides
 
@@ -62,6 +64,9 @@ Inputs of the reusable workflow:
    exits non-zero when the total is above zero. Pre-existing findings in the
    base branch are reported but never block.
 4. Daily full scans report backlog to the database; they never gate.
+5. Independently of findings, the gate checks **scanner integrity** and, with
+   `fail_closed: true`, fails when any scanner crashed or produced no/unparsable
+   output (next section).
 
 ## Dealing with a finding
 
@@ -79,13 +84,70 @@ full rule id and a one-line justification**, so the next reader sees why:
 Suppressions are reviewed like code; a suppression without a justification is
 a review finding.
 
-## Known gap: a crashed scanner looks like a clean scan
+## Scanner integrity and `fail_closed` (issue #14)
 
-The gate reads each scanner's result file and treats a missing file as zero
-findings (`[ -f semgrep-new-findings.json ] || echo '{"results":[]}'`). If a
-scanner job crashes before writing its report, the gate still passes. This is
-tracked on the Production Road Map; the fix is to make each scanner job's
-success a required input of the gate.
+**The gap.** Each scanner job swallows its tool's exit code (so findings never fail
+the job), and an "Ensure report exists" step writes an empty stub when no report was
+produced. A crashed, missing or misbehaving scanner therefore used to read as **zero
+findings**, and the gate passed.
+
+**Result files.** Every scanner job now also writes `<scanner>-status.json` into its
+artifact, computed from the raw tool output *before* the stub step runs:
+
+```json
+{"scanner": "gitleaks", "status": "ok", "reason": "", "scan_mode": "pr",
+ "tool_version": "8.30.1", "exit_code": "0", "findings": 0}
+```
+
+| Scanner | `status: ok` requires |
+|---|---|
+| Gitleaks | scan step ran, exit code 0 (clean) or 1 (leaks), report is a JSON array |
+| Trivy | every Trivy step for the mode (base + PR, or full) succeeded, each report is Trivy JSON (`SchemaVersion` present) |
+| Semgrep | scan step ran, exit code 0 or 1 (≥2 is a Semgrep error), report has a `results` array |
+
+The `security-gate` job's **Check Scanner Integrity** step treats a scanner as healthy
+only if its job result is `success` **and** its status file exists, parses and says
+`ok`. Any other case is printed as a `::warning::` in every run, added to the job
+summary and the PR comment.
+
+- `fail_closed: false` (default): the gate's pass/fail decision is exactly what it was
+  before; it only warns ("Security Gate is failing OPEN").
+- `fail_closed: true`: **Enforce Scanner Integrity** fails the gate.
+
+A missing *artifact* (scanner job died before uploading) already failed the gate at
+the download step before this change, and still does.
+
+### Rollout plan
+
+Every merge here is an org-wide release, so `fail_closed` ships default-off:
+
+1. Merge with default `false`. Watch a few PRs in several repos: the integrity step
+   should report all three scanners `ok` (no "failing OPEN" warning). Any warning is a
+   real broken scanner to fix first.
+2. Enable per repo by adding `fail_closed: true` under `with:` in that repo's
+   `.github/workflows/pr-security.yml` (start with this repo, then low-traffic repos,
+   then the deployed services). Confirm the next PR is green.
+3. Once every repo carries `fail_closed: true` and has been green for a week, flip the
+   input's default to `true` here (and update `examples/pr-security.yml`), then drop
+   the per-repo lines at leisure.
+
+### Proving the gate fails closed
+
+`simulate_crash` breaks one scanner for real: `gitleaks` replaces the binary with
+`exit 1`, `semgrep` shadows it on `PATH` with `exit 2`, `trivy` points the real Trivy
+at a path that does not exist. To re-prove after a change, push a throwaway commit to a
+PR branch here setting, in `pr-security.yml`:
+
+```yaml
+    with:
+      scan_mode: pr
+      enforce_new_findings: true
+      fail_closed: true        # gate must go RED
+      simulate_crash: trivy    # or gitleaks / semgrep
+```
+
+then the same with `fail_closed: false` (gate must stay GREEN with the "failing OPEN"
+warning), and drop the commits.
 
 ## VPS layout (`/opt/security-scanner`)
 

@@ -67,6 +67,25 @@ on:
         type: boolean
         default: false
 
+      # Issue #14. When true, the gate FAILS unless all three scanners wrote a
+      # parsable `<scanner>-status.json` with `status: ok` and their jobs succeeded.
+      # Default false = previous decisions unchanged; the gate only warns about
+      # missing/failed scanners. Rollout: enable per repo, then flip this default.
+      fail_closed:
+        description: "Fail the security gate when any scanner crashed or produced no/unparsable output"
+        required: false
+        type: boolean
+        default: false
+
+      # TEST-ONLY. Deliberately breaks one scanner so the fail_closed path can be
+      # proven (see README "Proving the gate fails closed"). Consumer repos must never
+      # set it. One of: none, gitleaks, trivy, semgrep.
+      simulate_crash:
+        description: "TEST ONLY: break one scanner on purpose (none|gitleaks|trivy|semgrep)"
+        required: false
+        type: string
+        default: "none"
+
 env:
   GITLEAKS_VERSION: "8.30.1"
 
@@ -116,11 +135,19 @@ jobs:
           sudo mv gitleaks /usr/local/bin/gitleaks
           gitleaks version
 
+      - name: Simulate Gitleaks Crash (test only)
+        if: inputs.simulate_crash == 'gitleaks'
+        run: |
+          echo "::warning::simulate_crash=gitleaks: replacing the gitleaks binary with 'exit 1'"
+          printf '#!/bin/sh\necho "simulated gitleaks crash" >&2\nexit 1\n' | sudo tee /usr/local/bin/gitleaks >/dev/null
+          sudo chmod +x /usr/local/bin/gitleaks
+
       # ======================================================
       # PR SCAN
       # ======================================================
 
       - name: Run Gitleaks - PR Changes
+        id: gitleaks_pr
         if: inputs.scan_mode == 'pr'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -137,8 +164,10 @@ jobs:
             --redact \
             --report-format json \
             --report-path gitleaks-new-findings.json
+          rc=$?
 
-          echo "Gitleaks exit code: $?"
+          echo "Gitleaks exit code: ${rc}"
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
 
           # Gitleaks returns 1 when findings are detected.
           # The security-gate job decides whether findings block the PR.
@@ -149,6 +178,7 @@ jobs:
       # ======================================================
 
       - name: Run Gitleaks - Full Repository
+        id: gitleaks_full
         if: inputs.scan_mode == 'full'
         run: |
           set +e
@@ -160,9 +190,42 @@ jobs:
             --redact \
             --report-format json \
             --report-path gitleaks-full-report.json
+          rc=$?
 
-          echo "Gitleaks exit code: $?"
+          echo "Gitleaks exit code: ${rc}"
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
           exit 0
+
+      # Must run BEFORE "Ensure Gitleaks Report Exists", which writes an empty stub.
+      # ok = scan step ran, exited 0 (clean) or 1 (leaks found), and its report is a
+      # JSON array. Gitleaks writes no report on a fatal error, so a crash cannot
+      # masquerade as a clean scan here.
+      - name: Record Gitleaks Status
+        if: always()
+        env:
+          SCAN_MODE: ${{ inputs.scan_mode }}
+          RC: ${{ inputs.scan_mode == 'pr' && steps.gitleaks_pr.outputs.rc || steps.gitleaks_full.outputs.rc }}
+        run: |
+          set -uo pipefail
+          if [ "$SCAN_MODE" = "pr" ]; then REPORT=gitleaks-new-findings.json; else REPORT=gitleaks-full-report.json; fi
+          VERSION=$(gitleaks version 2>/dev/null | head -n1 || true)
+          STATUS=failed; REASON=""; FINDINGS=null
+          if [ -z "$RC" ]; then
+            REASON="scan step did not run"
+          elif [ "$RC" != "0" ] && [ "$RC" != "1" ]; then
+            REASON="gitleaks exited ${RC}"
+          elif [ ! -s "$REPORT" ]; then
+            REASON="gitleaks exited ${RC} but wrote no report"
+          elif ! FINDINGS=$(jq -e 'if type == "array" then length else error("not an array") end' "$REPORT" 2>/dev/null); then
+            FINDINGS=null; REASON="report is not a JSON array"
+          else
+            STATUS=ok
+          fi
+          jq -n --arg status "$STATUS" --arg reason "$REASON" --arg mode "$SCAN_MODE" \
+            --arg version "${VERSION:-unknown}" --arg rc "${RC:-}" --argjson findings "$FINDINGS" \
+            '{scanner: "gitleaks", status: $status, reason: $reason, scan_mode: $mode,
+              tool_version: $version, exit_code: $rc, findings: $findings}' > gitleaks-status.json
+          cat gitleaks-status.json
 
       - name: Ensure Gitleaks Report Exists
         if: always()
@@ -183,6 +246,7 @@ jobs:
           path: |
             gitleaks-new-findings.json
             gitleaks-full-report.json
+            gitleaks-status.json
           if-no-files-found: ignore
           retention-days: 30
 
@@ -221,6 +285,7 @@ jobs:
           git worktree add --detach ../base-repository "${BASE_SHA}"
 
       - name: Scan Base Repository
+        id: trivy_base
         if: inputs.scan_mode == 'pr'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -234,11 +299,14 @@ jobs:
           exit-code: "0"
 
       - name: Scan PR Repository
+        id: trivy_pr
         if: inputs.scan_mode == 'pr'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
-          scan-ref: .
+          # simulate_crash=trivy points Trivy at a path that does not exist, so the
+          # real binary fails (test only; see the input's comment).
+          scan-ref: ${{ inputs.simulate_crash == 'trivy' && './simulated-trivy-crash-does-not-exist' || '.' }}
           format: json
           output: trivy-pr.json
           severity: CRITICAL,HIGH
@@ -247,17 +315,56 @@ jobs:
           exit-code: "0"
 
       - name: Full Trivy Scan
+        id: trivy_full
         if: inputs.scan_mode == 'full'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
-          scan-ref: .
+          scan-ref: ${{ inputs.simulate_crash == 'trivy' && './simulated-trivy-crash-does-not-exist' || '.' }}
           format: json
           output: trivy-full.json
           severity: CRITICAL,HIGH
           scanners: vuln
           vuln-type: os,library
           exit-code: "0"
+
+      # Must run BEFORE "Ensure Trivy Reports Exist", which writes empty stubs.
+      # ok = every scan step for this mode succeeded and each report is a Trivy JSON
+      # document (an object carrying SchemaVersion).
+      - name: Record Trivy Status
+        if: always()
+        env:
+          SCAN_MODE: ${{ inputs.scan_mode }}
+          BASE_OUTCOME: ${{ steps.trivy_base.outcome }}
+          PR_OUTCOME: ${{ steps.trivy_pr.outcome }}
+          FULL_OUTCOME: ${{ steps.trivy_full.outcome }}
+        run: |
+          set -uo pipefail
+          VERSION=$( (trivy --version 2>/dev/null || true) | head -n1)
+          STATUS=ok; REASON=""; FINDINGS=null
+          if [ "$SCAN_MODE" = "pr" ]; then
+            CHECKS="base:${BASE_OUTCOME}:trivy-base.json pr:${PR_OUTCOME}:trivy-pr.json"
+            COUNT_FILE=trivy-pr.json
+          else
+            CHECKS="full:${FULL_OUTCOME}:trivy-full.json"
+            COUNT_FILE=trivy-full.json
+          fi
+          for c in $CHECKS; do
+            IFS=: read -r name outcome report <<< "$c"
+            if [ "$outcome" != "success" ]; then
+              STATUS=failed; REASON="${REASON}${name} scan outcome '${outcome:-not run}'; "
+            elif ! jq -e 'type == "object" and has("SchemaVersion")' "$report" >/dev/null 2>&1; then
+              STATUS=failed; REASON="${REASON}${name} report missing or not Trivy JSON; "
+            fi
+          done
+          if [ "$STATUS" = "ok" ]; then
+            FINDINGS=$(jq '[.Results[]?.Vulnerabilities // []] | flatten | length' "$COUNT_FILE" 2>/dev/null || echo null)
+          fi
+          jq -n --arg status "$STATUS" --arg reason "$REASON" --arg mode "$SCAN_MODE" \
+            --arg version "${VERSION:-unknown}" --argjson findings "$FINDINGS" \
+            '{scanner: "trivy", status: $status, reason: $reason, scan_mode: $mode,
+              tool_version: $version, findings: $findings}' > trivy-status.json
+          cat trivy-status.json
 
       - name: Ensure Trivy Reports Exist
         if: always()
@@ -275,6 +382,7 @@ jobs:
             trivy-base.json
             trivy-pr.json
             trivy-full.json
+            trivy-status.json
           if-no-files-found: ignore
           retention-days: 30
 
@@ -310,7 +418,17 @@ jobs:
           python -m pip install semgrep
           semgrep --version
 
+      - name: Simulate Semgrep Crash (test only)
+        if: inputs.simulate_crash == 'semgrep'
+        run: |
+          echo "::warning::simulate_crash=semgrep: shadowing semgrep with 'exit 2'"
+          mkdir -p "$RUNNER_TEMP/simulated-crash"
+          printf '#!/bin/sh\necho "simulated semgrep crash" >&2\nexit 2\n' > "$RUNNER_TEMP/simulated-crash/semgrep"
+          chmod +x "$RUNNER_TEMP/simulated-crash/semgrep"
+          echo "$RUNNER_TEMP/simulated-crash" >> "$GITHUB_PATH"
+
       - name: Run Semgrep - PR Changes
+        id: semgrep_pr
         if: inputs.scan_mode == 'pr'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -323,10 +441,14 @@ jobs:
             --json \
             --output semgrep-new-findings.json \
             --metrics off
+          rc=$?
 
+          echo "Semgrep exit code: ${rc}"
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Run Semgrep - Full Repository
+        id: semgrep_full
         if: inputs.scan_mode == 'full'
         run: |
           set +e
@@ -336,8 +458,41 @@ jobs:
             --json \
             --output semgrep-full.json \
             --metrics off
+          rc=$?
 
+          echo "Semgrep exit code: ${rc}"
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
           exit 0
+
+      # Must run BEFORE "Ensure Semgrep Report Exists", which writes an empty stub.
+      # ok = semgrep exited 0/1 (1 = findings with --error; >=2 is a semgrep error)
+      # and the report is an object with a `results` array.
+      - name: Record Semgrep Status
+        if: always()
+        env:
+          SCAN_MODE: ${{ inputs.scan_mode }}
+          RC: ${{ inputs.scan_mode == 'pr' && steps.semgrep_pr.outputs.rc || steps.semgrep_full.outputs.rc }}
+        run: |
+          set -uo pipefail
+          if [ "$SCAN_MODE" = "pr" ]; then REPORT=semgrep-new-findings.json; else REPORT=semgrep-full.json; fi
+          VERSION=$( (semgrep --version 2>/dev/null || true) | head -n1)
+          STATUS=failed; REASON=""; FINDINGS=null
+          if [ -z "$RC" ]; then
+            REASON="scan step did not run"
+          elif [ "$RC" != "0" ] && [ "$RC" != "1" ]; then
+            REASON="semgrep exited ${RC}"
+          elif [ ! -s "$REPORT" ]; then
+            REASON="semgrep exited ${RC} but wrote no report"
+          elif ! FINDINGS=$(jq -e 'if (.results | type) == "array" then (.results | length) else error("no results array") end' "$REPORT" 2>/dev/null); then
+            FINDINGS=null; REASON="report has no results array"
+          else
+            STATUS=ok
+          fi
+          jq -n --arg status "$STATUS" --arg reason "$REASON" --arg mode "$SCAN_MODE" \
+            --arg version "${VERSION:-unknown}" --arg rc "${RC:-}" --argjson findings "$FINDINGS" \
+            '{scanner: "semgrep", status: $status, reason: $reason, scan_mode: $mode,
+              tool_version: $version, exit_code: $rc, findings: $findings}' > semgrep-status.json
+          cat semgrep-status.json
 
       - name: Ensure Semgrep Report Exists
         if: always()
@@ -358,6 +513,7 @@ jobs:
           path: |
             semgrep-new-findings.json
             semgrep-full.json
+            semgrep-status.json
           if-no-files-found: ignore
           retention-days: 30
 
@@ -478,10 +634,57 @@ jobs:
           echo "Semgrep findings: ${SEMGREP_NEW}"
           echo "Total findings: ${TOTAL_NEW}"
 
-          echo "gitleaks_new=${GITLEAKS_NEW}" >> "$GITHUB_OUTPUT"
-          echo "trivy_new=${TRIVY_NEW}" >> "$GITHUB_OUTPUT"
-          echo "semgrep_new=${SEMGREP_NEW}" >> "$GITHUB_OUTPUT"
-          echo "total_new=${TOTAL_NEW}" >> "$GITHUB_OUTPUT"
+          {
+            echo "gitleaks_new=${GITLEAKS_NEW}"
+            echo "trivy_new=${TRIVY_NEW}"
+            echo "semgrep_new=${SEMGREP_NEW}"
+            echo "total_new=${TOTAL_NEW}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Issue #14: a scanner is healthy only if its job succeeded AND it uploaded a
+      # parsable <scanner>-status.json with status "ok". This step never fails; it
+      # warns loudly in every run. "Enforce Scanner Integrity" below acts on it only
+      # when fail_closed is true.
+      - name: Check Scanner Integrity
+        id: integrity
+        env:
+          GITLEAKS_RESULT: ${{ needs.gitleaks.result }}
+          TRIVY_RESULT: ${{ needs.trivy.result }}
+          SEMGREP_RESULT: ${{ needs.semgrep.result }}
+          FAIL_CLOSED: ${{ inputs.fail_closed }}
+        run: |
+          set -uo pipefail
+          PROBLEMS=""
+          for s in gitleaks trivy semgrep; do
+            f="results/${s}/${s}-status.json"
+            var="$(echo "$s" | tr '[:lower:]' '[:upper:]')_RESULT"
+            job_result="${!var}"
+            problem=""
+            if [ ! -f "$f" ]; then
+              problem="no status file (job result: ${job_result})"
+            elif ! status=$(jq -er '.status | strings' "$f" 2>/dev/null); then
+              problem="status file unparsable (job result: ${job_result})"
+            elif [ "$status" != "ok" ]; then
+              problem="status '${status}': $(jq -r '.reason // ""' "$f") (job result: ${job_result})"
+            elif [ "$job_result" != "success" ]; then
+              problem="job result '${job_result}'"
+            fi
+            if [ -n "$problem" ]; then
+              echo "::warning title=Scanner ${s} did not run cleanly::${s}: ${problem}. Its findings count is NOT trustworthy."
+              PROBLEMS="${PROBLEMS}${s}: ${problem}; "
+            else
+              echo "${s}: ok ($(jq -c '{tool_version, findings}' "$f"))"
+            fi
+          done
+          if [ -n "$PROBLEMS" ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            if [ "$FAIL_CLOSED" != "true" ]; then
+              echo "::warning title=Security Gate is failing OPEN::fail_closed is false, so this gate still passes although a scanner did not run cleanly: ${PROBLEMS}"
+            fi
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "problems=${PROBLEMS}" >> "$GITHUB_OUTPUT"
 
       - name: Write Security Summary
         env:
@@ -490,6 +693,9 @@ jobs:
           SEMGREP_NEW: ${{ steps.findings.outputs.semgrep_new }}
           TOTAL_NEW: ${{ steps.findings.outputs.total_new }}
           SCAN_MODE: ${{ inputs.scan_mode }}
+          INTEGRITY_OK: ${{ steps.integrity.outputs.ok }}
+          INTEGRITY_PROBLEMS: ${{ steps.integrity.outputs.problems }}
+          FAIL_CLOSED: ${{ inputs.fail_closed }}
         run: |
           {
             echo "# 🛡️ Security Scan Results"
@@ -509,6 +715,19 @@ jobs:
             echo "| Semgrep | ${SEMGREP_NEW} |"
             echo "| **Total** | **${TOTAL_NEW}** |"
             echo ""
+
+            if [ "$INTEGRITY_OK" != "true" ]; then
+              echo "### ⚠️ Scanner integrity: NOT all scanners ran cleanly"
+              echo ""
+              echo "${INTEGRITY_PROBLEMS}"
+              echo ""
+              if [ "$FAIL_CLOSED" = "true" ]; then
+                echo "\`fail_closed: true\` — the gate fails."
+              else
+                echo "\`fail_closed: false\` — the gate is failing open; the counts above are not trustworthy."
+              fi
+              echo ""
+            fi
 
             if [ "$SCAN_MODE" = "pr" ]; then
               if [ "$TOTAL_NEW" -eq 0 ]; then
@@ -533,6 +752,9 @@ jobs:
           SEMGREP_NEW: ${{ steps.findings.outputs.semgrep_new }}
           TOTAL_NEW: ${{ steps.findings.outputs.total_new }}
           ENFORCE: ${{ inputs.enforce_new_findings }}
+          INTEGRITY_OK: ${{ steps.integrity.outputs.ok }}
+          INTEGRITY_PROBLEMS: ${{ steps.integrity.outputs.problems }}
+          FAIL_CLOSED: ${{ inputs.fail_closed }}
         with:
           script: |
             const prNumber = context.payload.pull_request?.number;
@@ -571,6 +793,14 @@ jobs:
               }
             }
 
+            if (process.env.INTEGRITY_OK !== "true") {
+              body += `\n\n### ⚠️ Scanner integrity: not all scanners ran cleanly\n\n`;
+              body += `${process.env.INTEGRITY_PROBLEMS || "unknown"}\n\n`;
+              body += process.env.FAIL_CLOSED === "true"
+                ? `**fail_closed is on: Security Gate FAILED.**`
+                : `**fail_closed is off: the gate is failing open; the counts above are not trustworthy.**`;
+            }
+
             body += `\n\n🤖 *Security scan results are available in the GitHub Actions run.*`;
 
             await github.rest.issues.createComment({
@@ -579,6 +809,18 @@ jobs:
               issue_number: prNumber,
               body
             });
+
+      - name: Enforce Scanner Integrity
+        if: inputs.fail_closed == true
+        env:
+          INTEGRITY_OK: ${{ steps.integrity.outputs.ok }}
+          INTEGRITY_PROBLEMS: ${{ steps.integrity.outputs.problems }}
+        run: |
+          if [ "$INTEGRITY_OK" != "true" ]; then
+            echo "::error::Security gate failed (fail_closed): not all scanners ran cleanly: ${INTEGRITY_PROBLEMS}"
+            exit 1
+          fi
+          echo "All three scanners ran cleanly."
 
       - name: Enforce Security Gate
         if: inputs.scan_mode == 'pr' && inputs.enforce_new_findings == true
