@@ -114,6 +114,14 @@ summary and the PR comment.
   before; it only warns ("Security Gate is failing OPEN").
 - `fail_closed: true`: **Enforce Scanner Integrity** fails the gate.
 
+**Trivy install.** The Trivy job installs a pinned Trivy (`TRIVY_VERSION` in the
+`Install Trivy` step) straight from the GitHub release, sha256-verified against the
+release's `checksums.txt`, and calls `trivy-action` with `skip-setup-trivy: true`. It no
+longer uses `setup-trivy`, whose install script downloads from `get.trivy.dev`; that host
+went NXDOMAIN on 2026-11-03 (curl exit 6, no scan ran in any repo). An install failure
+marks the job red and every scan step `skipped`, so the integrity check reports Trivy
+`failed`.
+
 A missing *artifact* (scanner job died before uploading) already failed the gate at
 the download step before this change, and still does.
 
