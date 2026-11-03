@@ -286,6 +286,30 @@ jobs:
       - name: Remove Stale Trivy Reports
         run: rm -f trivy-base.json trivy-pr.json trivy-full.json trivy-status.json
 
+      # Install Trivy ourselves from the GitHub release, checksum-verified, instead of
+      # letting trivy-action call setup-trivy. setup-trivy's install.sh fetches the
+      # tarball from https://get.trivy.dev (download-tracking redirect), and on
+      # 2026-11-03 that hostname started returning NXDOMAIN from its authoritative DNS,
+      # so curl exited 6 and no Trivy scan ran org-wide. GitHub release assets are the
+      # same files the redirect points at. Bump TRIVY_VERSION deliberately (it is the
+      # scanner version for every repo's gate).
+      - name: Install Trivy
+        id: trivy_install
+        env:
+          TRIVY_VERSION: "0.70.0"
+        run: |
+          set -euo pipefail
+          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          tmp=$(mktemp -d)
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -o "$tmp/$tarball" "$base/$tarball"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -o "$tmp/checksums.txt" "$base/trivy_${TRIVY_VERSION}_checksums.txt"
+          (cd "$tmp" && grep "  ${tarball}\$" checksums.txt | sha256sum -c -)
+          mkdir -p "$HOME/.local/bin/trivy-bin"
+          tar -xzf "$tmp/$tarball" -C "$HOME/.local/bin/trivy-bin" trivy
+          echo "$HOME/.local/bin/trivy-bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/trivy-bin/trivy" --version
+
       - name: Create Base Worktree
         if: inputs.scan_mode == 'pr'
         env:
@@ -299,6 +323,7 @@ jobs:
         if: inputs.scan_mode == 'pr'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          skip-setup-trivy: true
           scan-type: fs
           scan-ref: ../base-repository
           format: json
@@ -313,6 +338,7 @@ jobs:
         if: inputs.scan_mode == 'pr'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          skip-setup-trivy: true
           scan-type: fs
           # simulate_crash=trivy points Trivy at a path that does not exist, so the
           # real binary fails (test only; see the input's comment).
@@ -329,6 +355,7 @@ jobs:
         if: inputs.scan_mode == 'full'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
+          skip-setup-trivy: true
           scan-type: fs
           scan-ref: ${{ inputs.simulate_crash == 'trivy' && './simulated-trivy-crash-does-not-exist' || '.' }}
           format: json
