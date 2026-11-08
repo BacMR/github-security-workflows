@@ -119,9 +119,10 @@ sha256 in the workflow-level `env:` (`GITLEAKS_VERSION`/`GITLEAKS_SHA256`,
 `TRIVY_VERSION`/`TRIVY_SHA256`; bump both together, the digest comes from
 `gh api repos/<owner>/<repo>/releases/tags/v<ver> -q '.assets[].digest'`). Each install
 step tries, in order: an `actions/cache` copy of the tarball (re-verified), the direct
-`github.com/.../releases/download` URL, then the API asset endpoint via
-`gh release download` (a different serving path; it kept working on 2026-11-08 while
-the direct URL returned 504 for hours) — up to 6 rounds with 5/10/20/40/80 s backoff.
+`github.com/.../releases/download` URL, then the API asset endpoint
+(`api.github.com/repos/<o>/<r>/releases/assets/<id>`, a different serving path; it kept
+working on 2026-11-08 while the direct URL returned 504 for hours; anonymous first,
+because aquasecurity's org IP allow list rejects the caller's `GITHUB_TOKEN`) — up to 6 rounds with 5/10/20/40/80 s backoff.
 Trivy's vulnerability DBs come from `TRIVY_DB_REPOSITORY` / `TRIVY_JAVA_DB_REPOSITORY`
 (ECR Public, then mirror.gcr.io, then ghcr.io) and are cached by `trivy-action`
 (`cache: true`, keyed by date). Note: consumers run this on `pull_request` only, and

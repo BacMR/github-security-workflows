@@ -135,8 +135,8 @@ jobs:
           fetch-depth: 0
 
       # Issue #18. On 2026-11-08 github.com/<org>/<repo>/releases/download/... returned
-      # HTTP 504 for hours while the API asset endpoint (what `gh release download`
-      # uses, served via release-assets.githubusercontent.com) kept working. So:
+      # HTTP 504 for hours while the API asset endpoint (api.github.com/.../releases/
+      # assets/<id>, served via release-assets.githubusercontent.com) kept working. So:
       # verified tarball cache -> direct URL -> API asset endpoint, retried with
       # exponential backoff, always checked against the pinned GITLEAKS_SHA256.
       - name: Restore Gitleaks Tarball Cache
@@ -153,6 +153,23 @@ jobs:
           tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           dir="$HOME/.cache/bacmr-tools/gitleaks"; mkdir -p "$dir"
           verify() { echo "${GITLEAKS_SHA256}  $dir/$tarball" | sha256sum -c --status -; }
+          # Fallback: the release API asset endpoint (different serving path from
+          # /releases/download). Anonymous first: org IP allow lists (aquasecurity has
+          # one) reject the caller's GITHUB_TOKEN; the token only helps if anonymous
+          # calls hit the 60/h per-IP rate limit.
+          api_fetch() {  # owner/repo tag asset-name out-file
+            local hdrs url
+            for mode in anon token; do
+              hdrs=(-H "Accept: application/vnd.github+json")
+              [ "$mode" = token ] && hdrs+=(-H "Authorization: Bearer ${GH_TOKEN}")
+              url=$(curl -fsSL --retry 2 --retry-all-errors --connect-timeout 20 --max-time 60 "${hdrs[@]}" \
+                "https://api.github.com/repos/$1/releases/tags/$2" | jq -r --arg n "$3" '.assets[] | select(.name == $n) | .url') || url=""
+              [ -n "$url" ] || continue
+              hdrs[1]="Accept: application/octet-stream"
+              curl -fsSL --retry 2 --retry-all-errors --connect-timeout 20 --max-time 120 "${hdrs[@]}" -o "$4" "$url" && return 0
+            done
+            return 1
+          }
           if [ -s "$dir/$tarball" ] && verify; then
             echo "Using cached, sha256-verified $tarball"
           else
@@ -163,8 +180,7 @@ jobs:
                 && verify && break
               echo "::warning::Gitleaks direct download attempt $i failed; trying the API asset endpoint"
               rm -f "$dir/$tarball"
-              gh release download "v${GITLEAKS_VERSION}" -R gitleaks/gitleaks -p "$tarball" -D "$dir" --clobber \
-                && verify && break
+              api_fetch gitleaks/gitleaks "v${GITLEAKS_VERSION}" "$tarball" "$dir/$tarball" && verify && break
               if [ "$i" = 6 ]; then echo "::error::Gitleaks download failed after $i attempts"; exit 1; fi
               sleep $(( 5 * 2 ** (i - 1) ))
             done
@@ -342,7 +358,7 @@ jobs:
       #
       # Issue #18 (2026-11-08): the direct release URL returned HTTP 504 for hours
       # (curl exit 22) while the API asset endpoint kept working. Same chain as
-      # Gitleaks: verified tarball cache -> direct URL -> `gh release download`,
+      # Gitleaks: verified tarball cache -> direct URL -> API asset endpoint,
       # exponential backoff, pinned sha256 (no second checksums.txt download).
       - name: Restore Trivy Tarball Cache
         uses: actions/cache@v5
@@ -359,6 +375,23 @@ jobs:
           tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
           dir="$HOME/.cache/bacmr-tools/trivy"; mkdir -p "$dir"
           verify() { echo "${TRIVY_SHA256}  $dir/$tarball" | sha256sum -c --status -; }
+          # Fallback: the release API asset endpoint (different serving path from
+          # /releases/download). Anonymous first: org IP allow lists (aquasecurity has
+          # one) reject the caller's GITHUB_TOKEN; the token only helps if anonymous
+          # calls hit the 60/h per-IP rate limit.
+          api_fetch() {  # owner/repo tag asset-name out-file
+            local hdrs url
+            for mode in anon token; do
+              hdrs=(-H "Accept: application/vnd.github+json")
+              [ "$mode" = token ] && hdrs+=(-H "Authorization: Bearer ${GH_TOKEN}")
+              url=$(curl -fsSL --retry 2 --retry-all-errors --connect-timeout 20 --max-time 60 "${hdrs[@]}" \
+                "https://api.github.com/repos/$1/releases/tags/$2" | jq -r --arg n "$3" '.assets[] | select(.name == $n) | .url') || url=""
+              [ -n "$url" ] || continue
+              hdrs[1]="Accept: application/octet-stream"
+              curl -fsSL --retry 2 --retry-all-errors --connect-timeout 20 --max-time 120 "${hdrs[@]}" -o "$4" "$url" && return 0
+            done
+            return 1
+          }
           if [ -s "$dir/$tarball" ] && verify; then
             echo "Using cached, sha256-verified $tarball"
           else
@@ -369,8 +402,7 @@ jobs:
                 && verify && break
               echo "::warning::Trivy direct download attempt $i failed; trying the API asset endpoint"
               rm -f "$dir/$tarball"
-              gh release download "v${TRIVY_VERSION}" -R aquasecurity/trivy -p "$tarball" -D "$dir" --clobber \
-                && verify && break
+              api_fetch aquasecurity/trivy "v${TRIVY_VERSION}" "$tarball" "$dir/$tarball" && verify && break
               if [ "$i" = 6 ]; then echo "::error::Trivy download failed after $i attempts"; exit 1; fi
               sleep $(( 5 * 2 ** (i - 1) ))
             done
