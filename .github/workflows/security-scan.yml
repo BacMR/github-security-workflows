@@ -75,7 +75,10 @@ on:
         description: "Fail the security gate when any scanner crashed or produced no/unparsable output"
         required: false
         type: boolean
-        default: false
+        # Flipped to true for issue #18: on 2026-11-08 Trivy/Gitleaks died on 504
+        # downloads in many PRs and the gate still passed. A scanner that did not run
+        # cleanly now fails the gate; a repo can opt out with `fail_closed: false`.
+        default: true
 
       # TEST-ONLY. Deliberately breaks one scanner so the fail_closed path can be
       # proven (see README "Proving the gate fails closed"). Consumer repos must never
@@ -88,6 +91,13 @@ on:
 
 env:
   GITLEAKS_VERSION: "8.30.1"
+  # sha256 of gitleaks_<version>_linux_x64.tar.gz. Bump together with the version:
+  #   gh api repos/gitleaks/gitleaks/releases/tags/v<ver> -q '.assets[] | select(.name|test("linux_x64.tar.gz$")) | .digest'
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  # Pinned Trivy scanner version for every repo's gate + sha256 of
+  # trivy_<version>_Linux-64bit.tar.gz (same `gh api .../releases/tags/v<ver>` digest query).
+  TRIVY_VERSION: "0.70.0"
+  TRIVY_SHA256: "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
 
 # ============================================================
 # GITLEAKS
@@ -112,7 +122,7 @@ jobs:
     # This is a pin, not a decision to sit on 24.04 forever -- revisit it, do not
     # let it fossilise.
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     permissions:
       contents: read
@@ -124,15 +134,59 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Issue #18. On 2026-11-08 github.com/<org>/<repo>/releases/download/... returned
+      # HTTP 504 for hours while the API asset endpoint (api.github.com/.../releases/
+      # assets/<id>, served via release-assets.githubusercontent.com) kept working. So:
+      # verified tarball cache -> direct URL -> API asset endpoint, retried with
+      # exponential backoff, always checked against the pinned GITLEAKS_SHA256.
+      - name: Restore Gitleaks Tarball Cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/bacmr-tools/gitleaks
+          key: gitleaks-${{ runner.os }}-${{ env.GITLEAKS_VERSION }}-${{ env.GITLEAKS_SHA256 }}
+
       - name: Install Gitleaks
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          wget -q \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-
-          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
-          sudo mv gitleaks /usr/local/bin/gitleaks
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          dir="$HOME/.cache/bacmr-tools/gitleaks"; mkdir -p "$dir"
+          verify() { echo "${GITLEAKS_SHA256}  $dir/$tarball" | sha256sum -c --status -; }
+          # Fallback: the release API asset endpoint (different serving path from
+          # /releases/download). Anonymous first: org IP allow lists (aquasecurity has
+          # one) reject the caller's GITHUB_TOKEN; the token only helps if anonymous
+          # calls hit the 60/h per-IP rate limit.
+          api_fetch() {  # owner/repo tag asset-name out-file
+            local hdrs url
+            for mode in anon token; do
+              hdrs=(-H "Accept: application/vnd.github+json")
+              [ "$mode" = token ] && hdrs+=(-H "Authorization: Bearer ${GH_TOKEN}")
+              url=$(curl -fsSL --retry 2 --retry-all-errors --connect-timeout 20 --max-time 60 "${hdrs[@]}" \
+                "https://api.github.com/repos/$1/releases/tags/$2" | jq -r --arg n "$3" '.assets[] | select(.name == $n) | .url') || url=""
+              [ -n "$url" ] || continue
+              hdrs[1]="Accept: application/octet-stream"
+              curl -fsSL --retry 2 --retry-all-errors --connect-timeout 20 --max-time 120 "${hdrs[@]}" -o "$4" "$url" && return 0
+            done
+            return 1
+          }
+          if [ -s "$dir/$tarball" ] && verify; then
+            echo "Using cached, sha256-verified $tarball"
+          else
+            for i in 1 2 3 4 5 6; do
+              rm -f "$dir/$tarball"
+              curl -fsSL --retry 2 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 90 \
+                -o "$dir/$tarball" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$tarball" \
+                && verify && break
+              echo "::warning::Gitleaks direct download attempt $i failed; trying the API asset endpoint"
+              rm -f "$dir/$tarball"
+              api_fetch gitleaks/gitleaks "v${GITLEAKS_VERSION}" "$tarball" "$dir/$tarball" && verify && break
+              if [ "$i" = 6 ]; then echo "::error::Gitleaks download failed after $i attempts"; exit 1; fi
+              sleep $(( 5 * 2 ** (i - 1) ))
+            done
+          fi
+          tar -xzf "$dir/$tarball" -C "$RUNNER_TEMP" gitleaks
+          sudo mv "$RUNNER_TEMP/gitleaks" /usr/local/bin/gitleaks
           gitleaks version
 
       - name: Simulate Gitleaks Crash (test only)
@@ -269,6 +323,14 @@ jobs:
     permissions:
       contents: read
 
+    # Vulnerability DB mirrors, tried in order (issue #18): AWS ECR Public first, then
+    # Google's mirror, then ghcr.io, so one registry having a bad day does not stop the
+    # scan. The DB itself is cached by trivy-action (`cache: true`, actions/cache keyed
+    # by date with a restore-key fallback to the newest older day).
+    env:
+      TRIVY_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-db:2,mirror.gcr.io/aquasec/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+      TRIVY_JAVA_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-java-db:1,mirror.gcr.io/aquasec/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1"
+
     steps:
 
       - name: Checkout Code
@@ -291,22 +353,62 @@ jobs:
       # tarball from https://get.trivy.dev (download-tracking redirect), and on
       # 2026-11-03 that hostname started returning NXDOMAIN from its authoritative DNS,
       # so curl exited 6 and no Trivy scan ran org-wide. GitHub release assets are the
-      # same files the redirect points at. Bump TRIVY_VERSION deliberately (it is the
-      # scanner version for every repo's gate).
+      # same files the redirect points at. Bump TRIVY_VERSION + TRIVY_SHA256 (workflow
+      # env) deliberately: it is the scanner version for every repo's gate.
+      #
+      # Issue #18 (2026-11-08): the direct release URL returned HTTP 504 for hours
+      # (curl exit 22) while the API asset endpoint kept working. Same chain as
+      # Gitleaks: verified tarball cache -> direct URL -> API asset endpoint,
+      # exponential backoff, pinned sha256 (no second checksums.txt download).
+      - name: Restore Trivy Tarball Cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/bacmr-tools/trivy
+          key: trivy-${{ runner.os }}-${{ env.TRIVY_VERSION }}-${{ env.TRIVY_SHA256 }}
+
       - name: Install Trivy
         id: trivy_install
         env:
-          TRIVY_VERSION: "0.70.0"
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
           tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-          tmp=$(mktemp -d)
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -o "$tmp/$tarball" "$base/$tarball"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -o "$tmp/checksums.txt" "$base/trivy_${TRIVY_VERSION}_checksums.txt"
-          (cd "$tmp" && grep "  ${tarball}\$" checksums.txt | sha256sum -c -)
+          dir="$HOME/.cache/bacmr-tools/trivy"; mkdir -p "$dir"
+          verify() { echo "${TRIVY_SHA256}  $dir/$tarball" | sha256sum -c --status -; }
+          # Fallback: the release API asset endpoint (different serving path from
+          # /releases/download). Anonymous first: org IP allow lists (aquasecurity has
+          # one) reject the caller's GITHUB_TOKEN; the token only helps if anonymous
+          # calls hit the 60/h per-IP rate limit.
+          api_fetch() {  # owner/repo tag asset-name out-file
+            local hdrs url
+            for mode in anon token; do
+              hdrs=(-H "Accept: application/vnd.github+json")
+              [ "$mode" = token ] && hdrs+=(-H "Authorization: Bearer ${GH_TOKEN}")
+              url=$(curl -fsSL --retry 2 --retry-all-errors --connect-timeout 20 --max-time 60 "${hdrs[@]}" \
+                "https://api.github.com/repos/$1/releases/tags/$2" | jq -r --arg n "$3" '.assets[] | select(.name == $n) | .url') || url=""
+              [ -n "$url" ] || continue
+              hdrs[1]="Accept: application/octet-stream"
+              curl -fsSL --retry 2 --retry-all-errors --connect-timeout 20 --max-time 120 "${hdrs[@]}" -o "$4" "$url" && return 0
+            done
+            return 1
+          }
+          if [ -s "$dir/$tarball" ] && verify; then
+            echo "Using cached, sha256-verified $tarball"
+          else
+            for i in 1 2 3 4 5 6; do
+              rm -f "$dir/$tarball"
+              curl -fsSL --retry 2 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 120 \
+                -o "$dir/$tarball" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/$tarball" \
+                && verify && break
+              echo "::warning::Trivy direct download attempt $i failed; trying the API asset endpoint"
+              rm -f "$dir/$tarball"
+              api_fetch aquasecurity/trivy "v${TRIVY_VERSION}" "$tarball" "$dir/$tarball" && verify && break
+              if [ "$i" = 6 ]; then echo "::error::Trivy download failed after $i attempts"; exit 1; fi
+              sleep $(( 5 * 2 ** (i - 1) ))
+            done
+          fi
           mkdir -p "$HOME/.local/bin/trivy-bin"
-          tar -xzf "$tmp/$tarball" -C "$HOME/.local/bin/trivy-bin" trivy
+          tar -xzf "$dir/$tarball" -C "$HOME/.local/bin/trivy-bin" trivy
           echo "$HOME/.local/bin/trivy-bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/trivy-bin/trivy" --version
 
@@ -324,6 +426,7 @@ jobs:
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           skip-setup-trivy: true
+          cache: true
           scan-type: fs
           scan-ref: ../base-repository
           format: json
@@ -339,6 +442,7 @@ jobs:
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           skip-setup-trivy: true
+          cache: true
           scan-type: fs
           # simulate_crash=trivy points Trivy at a path that does not exist, so the
           # real binary fails (test only; see the input's comment).
@@ -356,6 +460,7 @@ jobs:
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           skip-setup-trivy: true
+          cache: true
           scan-type: fs
           scan-ref: ${{ inputs.simulate_crash == 'trivy' && './simulated-trivy-crash-does-not-exist' || '.' }}
           format: json

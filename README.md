@@ -49,7 +49,7 @@ Inputs of the reusable workflow:
 |---|---|---|
 | `scan_mode` | `pr` | `pr` compares the PR against its base; `full` scans the whole tree (used by the daily scan) |
 | `enforce_new_findings` | `false` | when `true`, the gate job fails if the PR introduced new findings |
-| `fail_closed` | `false` | when `true`, the gate job fails unless **all three scanners ran cleanly** (see "Scanner integrity" below). When `false`, decisions are unchanged but every run warns about any scanner that did not run cleanly |
+| `fail_closed` | `true` | when `true`, the gate job fails unless **all three scanners ran cleanly** (see "Scanner integrity" below). When `false`, decisions are unchanged but every run warns about any scanner that did not run cleanly |
 | `simulate_crash` | `none` | **test only** — `gitleaks`, `trivy` or `semgrep` deliberately breaks that scanner to prove `fail_closed`. Never set it in a consumer repo |
 
 ## How the gate decides
@@ -110,13 +110,27 @@ only if its job result is `success` **and** its status file exists, parses and s
 `ok`. Any other case is printed as a `::warning::` in every run, added to the job
 summary and the PR comment.
 
-- `fail_closed: false` (default): the gate's pass/fail decision is exactly what it was
-  before; it only warns ("Security Gate is failing OPEN").
-- `fail_closed: true`: **Enforce Scanner Integrity** fails the gate.
+- `fail_closed: true` (default since issue #18): **Enforce Scanner Integrity** fails the gate.
+- `fail_closed: false` (opt-out): the gate's pass/fail decision ignores scanner health;
+  it only warns ("Security Gate is failing OPEN").
 
-**Trivy install.** The Trivy job installs a pinned Trivy (`TRIVY_VERSION` in the
-`Install Trivy` step) straight from the GitHub release, sha256-verified against the
-release's `checksums.txt`, and calls `trivy-action` with `skip-setup-trivy: true`. It no
+**Scanner downloads (issue #18).** Gitleaks and Trivy are pinned by version *and*
+sha256 in the workflow-level `env:` (`GITLEAKS_VERSION`/`GITLEAKS_SHA256`,
+`TRIVY_VERSION`/`TRIVY_SHA256`; bump both together, the digest comes from
+`gh api repos/<owner>/<repo>/releases/tags/v<ver> -q '.assets[].digest'`). Each install
+step tries, in order: an `actions/cache` copy of the tarball (re-verified), the direct
+`github.com/.../releases/download` URL, then the API asset endpoint
+(`api.github.com/repos/<o>/<r>/releases/assets/<id>`, a different serving path; it kept
+working on 2026-11-08 while the direct URL returned 504 for hours; anonymous first,
+because aquasecurity's org IP allow list rejects the caller's `GITHUB_TOKEN`) — up to 6 rounds with 5/10/20/40/80 s backoff.
+Trivy's vulnerability DBs come from `TRIVY_DB_REPOSITORY` / `TRIVY_JAVA_DB_REPOSITORY`
+(ECR Public, then mirror.gcr.io, then ghcr.io) and are cached by `trivy-action`
+(`cache: true`, keyed by date). Note: consumers run this on `pull_request` only, and
+Actions caches written by a PR are visible to that PR alone (plus caches from the base
+branch), so the tarball cache mainly helps reruns; the fallback endpoint is the real fix.
+
+**Trivy install.** The Trivy job installs the pinned Trivy straight from the GitHub
+release, sha256-verified, and calls `trivy-action` with `skip-setup-trivy: true`. It no
 longer uses `setup-trivy`, whose install script downloads from `get.trivy.dev`; that host
 went NXDOMAIN on 2026-11-03 (curl exit 6, no scan ran in any repo). An install failure
 marks the job red and every scan step `skipped`, so the integrity check reports Trivy
@@ -127,7 +141,10 @@ the download step before this change, and still does.
 
 ### Rollout plan
 
-Every merge here is an org-wide release, so `fail_closed` ships default-off:
+Every merge here is an org-wide release, so `fail_closed` first shipped default-off.
+**Status (issue #18, 2026-11-08): step 3 done early** — the default is now `true`,
+because scanners dying on 504 downloads let PRs merge with no Trivy/Gitleaks scan.
+The original plan, for the record:
 
 1. Merge with default `false`. Watch a few PRs in several repos: the integrity step
    should report all three scanners `ok` (no "failing OPEN" warning). Any warning is a
