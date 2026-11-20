@@ -22,7 +22,8 @@ guide for the repo; it adds the working conventions. There is no `CLAUDE.md`.
 
 - `security-scan.yml` — reusable (`workflow_call`) PR Security Gate on GitHub-hosted
   runners. One `scan` job runs Gitleaks, Semgrep and Trivy as steps that never fail on
-  findings; only `security-gate` (on `ubuntu-slim`) can block. Required check name:
+  findings; only `security-gate` (on `ubuntu-slim`) can block, and it is always
+  fail-closed (the `fail_closed` input is deprecated and ignored). Required check name:
   `security / Security Gate` — never rename the `Security Gate` job.
 - `security-self-test.yml` — proves the gate fails closed (findings, scanner errors,
   skipped steps) against runtime-generated fixtures; dispatch it after a gate change.

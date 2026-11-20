@@ -52,8 +52,8 @@ Inputs of the reusable workflow:
 |---|---|---|
 | `scan_mode` | `pr` | `pr` compares the PR against its base; `full` scans the whole tree (used by the daily scan) |
 | `enforce_new_findings` | `false` | when `true`, the gate job fails if the PR introduced new findings |
-| `fail_closed` | `true` | when `true`, the gate job fails unless **all three scanners ran cleanly** (see "Scanner integrity" below). When `false`, decisions are unchanged but every run warns about any scanner that did not run cleanly |
-| `simulate_crash` | `none` | **test only** — `gitleaks`, `trivy` or `semgrep` deliberately breaks that scanner to prove `fail_closed`. Never set it in a consumer repo |
+| `fail_closed` | `true` | **deprecated, ignored** (2026-11-19): the gate is always fail-closed. Still accepted so no caller breaks; passing `false` only emits a deprecation warning. Remove it from callers |
+| `simulate_crash` | `none` | **test only** — `gitleaks`, `trivy` or `semgrep` deliberately breaks that scanner to prove the gate fails closed. Never set it in a consumer repo |
 | `self_test` | `none` | **test only**, used by `security-self-test.yml` — `clean`, `gitleaks`, `semgrep`, `trivy` or `error` scans a fixture generated at runtime. Refused outside this repo |
 
 ## How the gate decides
@@ -74,7 +74,7 @@ Inputs of the reusable workflow:
    base branch are reported but never block.
 4. Daily full scans report backlog to the database; they never gate.
 5. Independently of findings, the gate checks **scanner integrity** and, with
-   `fail_closed: true`, fails when any scanner crashed or produced no/unparsable
+   always fails when any scanner crashed, was skipped or produced no/unparsable
    output (next section).
 
 ## Dealing with a finding
@@ -93,7 +93,7 @@ full rule id and a one-line justification**, so the next reader sees why:
 Suppressions are reviewed like code; a suppression without a justification is
 a review finding.
 
-## Scanner integrity and `fail_closed` (issue #14)
+## Scanner integrity: always fail-closed (issues #14, #18)
 
 **The gap.** Each scanner job swallows its tool's exit code (so findings never fail
 the job), and an "Ensure report exists" step writes an empty stub when no report was
@@ -125,10 +125,9 @@ the job summary and the PR comment.
 
 - Always: **Require Scan Job Success** fails the gate if the scan job failed, timed out
   or was cancelled (before the merge the artifact download failed the gate in that case).
-
-- `fail_closed: true` (default since issue #18): **Enforce Scanner Integrity** fails the gate.
-- `fail_closed: false` (opt-out): the gate's pass/fail decision ignores scanner health;
-  it only warns ("Security Gate is failing OPEN").
+- Always: **Enforce Scanner Integrity** fails the gate unless all three are `success`.
+  There is no opt-out. The `fail_closed` input is deprecated and ignored (since
+  2026-11-19); `fail_closed: false` only adds a "fail_closed is deprecated" warning.
 
 **Scanner downloads (issue #18).** Gitleaks and Trivy are pinned by version *and*
 sha256 in the workflow-level `env:` (`GITLEAKS_VERSION`/`GITLEAKS_SHA256`,
@@ -154,7 +153,9 @@ no longer skips anything: the Trivy steps still run, fail, and the Trivy status 
 
 ### Rollout plan
 
-Every merge here is an org-wide release, so `fail_closed` first shipped default-off.
+**Superseded 2026-11-19:** the gate is now always fail-closed and `fail_closed` is
+ignored. Kept for the record: every merge here is an org-wide release, so `fail_closed`
+first shipped default-off.
 **Status (issue #18, 2026-11-08): step 3 done early** — the default is now `true`,
 because scanners dying on 504 downloads let PRs merge with no Trivy/Gitleaks scan.
 The original plan, for the record:
@@ -192,6 +193,7 @@ pushed) and scans that one commit, so no real secret or vulnerable code lands on
 | `error` | gitleaks binary deleted (exit 127) | RED |
 | `crash-gitleaks` / `crash-semgrep` / `crash-trivy` | `simulate_crash`: binary replaced with `exit 1`, shadowed with `exit 2`, Trivy pointed at a missing path | RED |
 | `skipped` | `scan_mode` that matches no scan step, so every scanner step is skipped | RED |
+| `failopen-crash` | caller passes the deprecated `fail_closed: false` + `simulate_crash: semgrep` | RED, and `verify` also requires the deprecation warning annotation |
 
 The `verify` job asserts each case's `Security Gate` conclusion, so a green self-test run
 means the clean case passed and every failure case was blocked.

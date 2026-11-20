@@ -13,6 +13,8 @@ name: Security Self-Test
 #   error          gitleaks binary deleted (exit 127)     -> gate RED (scanner error)
 #   crash-<s>      simulate_crash=<s> (exit 1/2, bad path) -> gate RED (scanner error)
 #   skipped        scan_mode matches no step, every scanner step is skipped -> gate RED
+#   failopen-crash caller passes deprecated fail_closed: false + semgrep crash
+#                  -> gate still RED, plus the deprecation warning annotation
 #
 # The `verify` job asserts every case's `Security Gate` job concluded as expected, so a
 # green run of this workflow means: clean passed and every failure case was blocked.
@@ -39,13 +41,14 @@ on:
           - crash-semgrep
           - crash-trivy
           - skipped
+          - failopen-crash
 
 concurrency:
   group: security-self-test-${{ github.ref }}-${{ inputs.case || 'all' }}
   cancel-in-progress: true
 
 env:
-  ALL_CASES: '["clean","gitleaks","semgrep","trivy","error","crash-gitleaks","crash-semgrep","crash-trivy","skipped"]'
+  ALL_CASES: '["clean","gitleaks","semgrep","trivy","error","crash-gitleaks","crash-semgrep","crash-trivy","skipped","failopen-crash"]'
 
 # The called workflow's gate job requests these; a caller must grant at least as much.
 permissions:
@@ -84,9 +87,10 @@ jobs:
     with:
       scan_mode: ${{ matrix.case == 'skipped' && 'self-test-skip-every-step' || 'pr' }}
       enforce_new_findings: true
-      fail_closed: true
-      self_test: ${{ (startsWith(matrix.case, 'crash-') || matrix.case == 'skipped') && 'clean' || matrix.case }}
-      simulate_crash: ${{ matrix.case == 'crash-gitleaks' && 'gitleaks' || matrix.case == 'crash-semgrep' && 'semgrep' || matrix.case == 'crash-trivy' && 'trivy' || 'none' }}
+      # Deprecated and ignored by the gate; failopen-crash passes false to prove that.
+      fail_closed: ${{ matrix.case != 'failopen-crash' }}
+      self_test: ${{ (startsWith(matrix.case, 'crash-') || matrix.case == 'skipped' || matrix.case == 'failopen-crash') && 'clean' || matrix.case }}
+      simulate_crash: ${{ matrix.case == 'crash-gitleaks' && 'gitleaks' || (matrix.case == 'crash-semgrep' || matrix.case == 'failopen-crash') && 'semgrep' || matrix.case == 'crash-trivy' && 'trivy' || 'none' }}
 
   verify:
     name: Verify gate results
@@ -96,6 +100,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       actions: read
+      checks: read
     steps:
       - name: Assert each case's Security Gate conclusion
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -122,15 +127,28 @@ jobs:
               const gate = jobs.find((j) => j.name === `self-test ${c} / Security Gate`);
               const scan = jobs.find((j) => j.name.startsWith(`self-test ${c} / Scan`));
               const actual = gate ? gate.conclusion : "missing";
-              const ok = actual === expected;
+              let ok = actual === expected;
+              let note = "";
+              if (c === "failopen-crash" && gate) {
+                const annotations = await github.paginate(github.rest.checks.listAnnotations, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  check_run_id: gate.id,
+                  per_page: 100,
+                });
+                const warned = annotations.some((a) => a.annotation_level === "warning" && a.message.includes("fail_closed is deprecated and ignored"));
+                note = warned ? "deprecation warning present" : "deprecation warning MISSING";
+                ok = ok && warned;
+              }
               if (!ok) failed = true;
-              rows.push([c, expected, actual ?? "pending", scan?.conclusion ?? "missing", ok ? "PASS" : "FAIL", gate?.html_url ?? ""]);
+              rows.push([c, expected, actual ?? "pending", scan?.conclusion ?? "missing", ok ? "PASS" : "FAIL", note, gate?.html_url ?? ""]);
             }
             await core.summary
               .addHeading("Security gate self-test")
               .addTable([
                 [{ data: "case", header: true }, { data: "expected gate", header: true }, { data: "actual gate", header: true },
-                 { data: "scan job", header: true }, { data: "result", header: true }, { data: "gate job", header: true }],
+                 { data: "scan job", header: true }, { data: "result", header: true }, { data: "note", header: true },
+                 { data: "gate job", header: true }],
                 ...rows,
               ])
               .write();

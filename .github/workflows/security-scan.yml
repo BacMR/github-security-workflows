@@ -75,17 +75,17 @@ on:
         type: boolean
         default: false
 
-      # Issue #14. When true, the gate FAILS unless all three scanners ran cleanly.
+      # DEPRECATED and IGNORED (2026-11-19): the gate is always fail-closed. Still
+      # declared so callers that pass it do not break; `false` only emits a warning.
+      # History: issue #14 added it default-off, issue #18 flipped it on after 504
+      # scanner downloads let PRs merge unscanned.
       fail_closed:
-        description: "Fail the security gate when any scanner crashed or produced no/unparsable output"
+        description: "DEPRECATED, ignored: the security gate is always fail-closed"
         required: false
         type: boolean
-        # Flipped to true for issue #18: on 2026-11-08 Trivy/Gitleaks died on 504
-        # downloads in many PRs and the gate still passed. A scanner that did not run
-        # cleanly now fails the gate; a repo can opt out with `fail_closed: false`.
         default: true
 
-      # TEST-ONLY. Deliberately breaks one scanner so the fail_closed path can be
+      # TEST-ONLY. Deliberately breaks one scanner so the fail-closed path can be
       # proven (see README "Proving the gate fails closed"). Consumer repos must never
       # set it. One of: none, gitleaks, trivy, semgrep.
       simulate_crash:
@@ -868,11 +868,15 @@ jobs:
 
     steps:
 
-      - name: Validate Test-Only Inputs
+      - name: Validate Inputs
         env:
           SIMULATE_CRASH: ${{ inputs.simulate_crash }}
           SELF_TEST: ${{ inputs.self_test }}
+          FAIL_CLOSED: ${{ inputs.fail_closed }}
         run: |
+          if [ "$FAIL_CLOSED" != "true" ]; then
+            echo "::warning title=fail_closed is deprecated::fail_closed is deprecated and ignored; the security gate is always fail-closed. Remove it from this repo's pr-security.yml."
+          fi
           case "$SIMULATE_CRASH" in
             none|gitleaks|trivy|semgrep) echo "simulate_crash=${SIMULATE_CRASH}" ;;
             *) echo "::error::Unknown simulate_crash value '${SIMULATE_CRASH}' (expected none|gitleaks|trivy|semgrep)"; exit 1 ;;
@@ -884,7 +888,7 @@ jobs:
 
       # Healthy = scan job result `success` AND each scanner's recorded outcome is
       # exactly `success`. Anything else, including an empty (missing) output, is a
-      # problem. This step never fails; the enforce steps below act on it.
+      # problem. This step never fails; "Enforce Scanner Integrity" acts on it.
       - name: Check Scanner Integrity
         id: integrity
         env:
@@ -895,7 +899,6 @@ jobs:
           GITLEAKS_REASON: ${{ needs.scan.outputs.gitleaks_reason }}
           SEMGREP_REASON: ${{ needs.scan.outputs.semgrep_reason }}
           TRIVY_REASON: ${{ needs.scan.outputs.trivy_reason }}
-          FAIL_CLOSED: ${{ inputs.fail_closed }}
         run: |
           set -uo pipefail
           PROBLEMS=""
@@ -917,9 +920,6 @@ jobs:
           done
           if [ -n "$PROBLEMS" ]; then
             echo "ok=false" >> "$GITHUB_OUTPUT"
-            if [ "$FAIL_CLOSED" != "true" ]; then
-              echo "::warning title=Security Gate is failing OPEN::fail_closed is false, so this gate ignores scanner health: ${PROBLEMS}"
-            fi
           else
             echo "ok=true" >> "$GITHUB_OUTPUT"
           fi
@@ -934,7 +934,6 @@ jobs:
           SCAN_MODE: ${{ inputs.scan_mode }}
           INTEGRITY_OK: ${{ steps.integrity.outputs.ok }}
           INTEGRITY_PROBLEMS: ${{ steps.integrity.outputs.problems }}
-          FAIL_CLOSED: ${{ inputs.fail_closed }}
         run: |
           {
             echo "# 🛡️ Security Scan Results"
@@ -960,11 +959,7 @@ jobs:
               echo ""
               echo "${INTEGRITY_PROBLEMS}"
               echo ""
-              if [ "$FAIL_CLOSED" = "true" ]; then
-                echo "\`fail_closed: true\` — the gate fails."
-              else
-                echo "\`fail_closed: false\` — the gate is failing open; the counts above are not trustworthy."
-              fi
+              echo "The gate fails: the counts above are not trustworthy."
               echo ""
             fi
 
@@ -993,7 +988,6 @@ jobs:
           ENFORCE: ${{ inputs.enforce_new_findings }}
           INTEGRITY_OK: ${{ steps.integrity.outputs.ok }}
           INTEGRITY_PROBLEMS: ${{ steps.integrity.outputs.problems }}
-          FAIL_CLOSED: ${{ inputs.fail_closed }}
         with:
           script: |
             const prNumber = context.payload.pull_request?.number;
@@ -1035,9 +1029,7 @@ jobs:
             if (process.env.INTEGRITY_OK !== "true") {
               body += `\n\n### ⚠️ Scanner integrity: not all scanners ran cleanly\n\n`;
               body += `${process.env.INTEGRITY_PROBLEMS || "unknown"}\n\n`;
-              body += process.env.FAIL_CLOSED === "true"
-                ? `**fail_closed is on: Security Gate FAILED.**`
-                : `**fail_closed is off: the gate is failing open; the counts above are not trustworthy.**`;
+              body += `**Security Gate FAILED: the gate is always fail-closed.**`;
             }
 
             body += `\n\n🤖 *Security scan results are available in the GitHub Actions run.*`;
@@ -1049,8 +1041,8 @@ jobs:
               body
             });
 
-      # Unconditional, whatever fail_closed says: a scan job that failed, timed out or
-      # was cancelled never produced trustworthy outputs. (Before the merge, the gate's
+      # A scan job that failed, timed out or was cancelled never produced trustworthy
+      # outputs. (Before the merge, the gate's
       # artifact download failed in that case, so this is not a behaviour change.)
       - name: Require Scan Job Success
         env:
@@ -1062,14 +1054,14 @@ jobs:
           fi
           echo "Scan job: success"
 
+      # Always on; the deprecated fail_closed input cannot turn it off.
       - name: Enforce Scanner Integrity
-        if: inputs.fail_closed == true
         env:
           INTEGRITY_OK: ${{ steps.integrity.outputs.ok }}
           INTEGRITY_PROBLEMS: ${{ steps.integrity.outputs.problems }}
         run: |
           if [ "$INTEGRITY_OK" != "true" ]; then
-            echo "::error::Security gate failed (fail_closed): not all scanners ran cleanly: ${INTEGRITY_PROBLEMS}"
+            echo "::error::Security gate failed: not all scanners ran cleanly: ${INTEGRITY_PROBLEMS}"
             exit 1
           fi
           echo "All three scanners ran cleanly."
