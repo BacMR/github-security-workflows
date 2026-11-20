@@ -30,7 +30,7 @@ jobs:
   # for human PRs, so it cannot be a `needs` here and is not covered by this gate.
   gate:
     name: gate
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-slim # bookkeeping only: 1 vCPU, a third of a standard minute
     timeout-minutes: 5
     if: always()
     needs:
