@@ -54,15 +54,21 @@ Inputs of the reusable workflow:
 | `enforce_new_findings` | `false` | when `true`, the gate job fails if the PR introduced new findings |
 | `fail_closed` | `true` | when `true`, the gate job fails unless **all three scanners ran cleanly** (see "Scanner integrity" below). When `false`, decisions are unchanged but every run warns about any scanner that did not run cleanly |
 | `simulate_crash` | `none` | **test only** — `gitleaks`, `trivy` or `semgrep` deliberately breaks that scanner to prove `fail_closed`. Never set it in a consumer repo |
+| `self_test` | `none` | **test only**, used by `security-self-test.yml` — `clean`, `gitleaks`, `semgrep`, `trivy` or `error` scans a fixture generated at runtime. Refused outside this repo |
 
 ## How the gate decides
 
-1. Each scanner runs in its own job and **never fails on findings**; the three
-   jobs always complete so the gate can read all three results.
+1. One `scan` job (check `security / Scan (Gitleaks, Semgrep, Trivy)`) runs the three
+   scanners as steps that **never fail on findings** and keep going when a scanner
+   errors (`continue-on-error`), so all three always report. It counts the findings
+   and exposes them, plus each scanner's verdict, as job outputs. (Until 2026-11-19
+   each scanner was its own job; merging them saves ~2 billed minutes per PR, because
+   every job is rounded up to a whole minute.)
 2. In `pr` mode each scanner is run with the PR's base commit as the baseline
    (Semgrep `--baseline-commit`, Gitleaks on the commit range, Trivy on the
    changed manifests), so only findings **introduced by the PR** count.
-3. The `security-gate` job sums `GITLEAKS_NEW + TRIVY_NEW + SEMGREP_NEW`,
+3. The `security-gate` job (on the 1-vCPU `ubuntu-slim` runner, no checkout or
+   artifacts) reads `GITLEAKS_NEW + TRIVY_NEW + SEMGREP_NEW` from the scan job,
    posts a results table as a PR comment, and with `enforce_new_findings: true`
    exits non-zero when the total is above zero. Pre-existing findings in the
    base branch are reported but never block.
@@ -94,8 +100,9 @@ the job), and an "Ensure report exists" step writes an empty stub when no report
 produced. A crashed, missing or misbehaving scanner therefore used to read as **zero
 findings**, and the gate passed.
 
-**Result files.** Every scanner job now also writes `<scanner>-status.json` into its
-artifact, computed from the raw tool output *before* the stub step runs:
+**Result files.** Each scanner also writes `<scanner>-status.json` into its artifact
+(`gitleaks-results`, `semgrep-results`, `trivy-results`), computed from the raw tool
+output *before* the stub step runs:
 
 ```json
 {"scanner": "gitleaks", "status": "ok", "reason": "", "scan_mode": "pr",
@@ -108,10 +115,16 @@ artifact, computed from the raw tool output *before* the stub step runs:
 | Trivy | every Trivy step for the mode (base + PR, or full) succeeded, each report is Trivy JSON (`SchemaVersion` present) |
 | Semgrep | scan step ran, exit code 0 or 1 (≥2 is a Semgrep error), report has a `results` array |
 
-The `security-gate` job's **Check Scanner Integrity** step treats a scanner as healthy
-only if its job result is `success` **and** its status file exists, parses and says
-`ok`. Any other case is printed as a `::warning::` in every run, added to the job
-summary and the PR comment.
+The **Record `<Scanner>` Status** step that writes the file exits non-zero unless the
+status is `ok` (it is `continue-on-error`, so the job carries on). Its `outcome`
+(`success` / `failure` / `skipped` / `cancelled`) is a scan-job output. The gate's
+**Check Scanner Integrity** step treats the scanners as healthy only if the scan job's
+result is `success` **and** all three outcomes are exactly `success`; a missing output
+is not `success`. Any other case is printed as a `::warning::` in every run, added to
+the job summary and the PR comment.
+
+- Always: **Require Scan Job Success** fails the gate if the scan job failed, timed out
+  or was cancelled (before the merge the artifact download failed the gate in that case).
 
 - `fail_closed: true` (default since issue #18): **Enforce Scanner Integrity** fails the gate.
 - `fail_closed: false` (opt-out): the gate's pass/fail decision ignores scanner health;
@@ -132,15 +145,12 @@ Trivy's vulnerability DBs come from `TRIVY_DB_REPOSITORY` / `TRIVY_JAVA_DB_REPOS
 Actions caches written by a PR are visible to that PR alone (plus caches from the base
 branch), so the tarball cache mainly helps reruns; the fallback endpoint is the real fix.
 
-**Trivy install.** The Trivy job installs the pinned Trivy straight from the GitHub
+**Trivy install.** The scan job installs the pinned Trivy straight from the GitHub
 release, sha256-verified, and calls `trivy-action` with `skip-setup-trivy: true`. It no
 longer uses `setup-trivy`, whose install script downloads from `get.trivy.dev`; that host
 went NXDOMAIN on 2026-11-03 (curl exit 6, no scan ran in any repo). An install failure
-marks the job red and every scan step `skipped`, so the integrity check reports Trivy
+no longer skips anything: the Trivy steps still run, fail, and the Trivy status records
 `failed`.
-
-A missing *artifact* (scanner job died before uploading) already failed the gate at
-the download step before this change, and still does.
 
 ### Rollout plan
 
@@ -161,21 +171,29 @@ The original plan, for the record:
 
 ### Proving the gate fails closed
 
-`simulate_crash` breaks one scanner for real: `gitleaks` replaces the binary with
-`exit 1`, `semgrep` shadows it on `PATH` with `exit 2`, `trivy` points the real Trivy
-at a path that does not exist. To re-prove after a change, push a throwaway commit to a
-PR branch here setting, in `pr-security.yml`:
+Run **Security Self-Test** (`.github/workflows/security-self-test.yml`):
 
-```yaml
-    with:
-      scan_mode: pr
-      enforce_new_findings: true
-      fail_closed: true        # gate must go RED
-      simulate_crash: trivy    # or gitleaks / semgrep
+```bash
+gh workflow run security-self-test.yml --ref <branch>             # every case
+gh workflow run security-self-test.yml --ref <branch> -f case=trivy
 ```
 
-then the same with `fail_closed: false` (gate must stay GREEN with the "failing OPEN"
-warning), and drop the commits.
+It also runs on any PR that changes `security-scan.yml` or the self-test. Each case calls
+the real reusable workflow. The scan job commits a fixture generated at runtime (never
+pushed) and scans that one commit, so no real secret or vulnerable code lands on a branch:
+
+| Case | What it does | Gate |
+|---|---|---|
+| `clean` | harmless file | GREEN |
+| `gitleaks` | random fake GitHub PAT + AWS key id (`ghp_SELFTEST…`, `AKIASELFTEST…`) | RED |
+| `semgrep` | Python that matches `p/default` (`shell=True`, `eval`, Flask debug) | RED |
+| `trivy` | `requirements.txt` pinning Django 2.2.0 / PyYAML 5.3 | RED |
+| `error` | gitleaks binary deleted (exit 127) | RED |
+| `crash-gitleaks` / `crash-semgrep` / `crash-trivy` | `simulate_crash`: binary replaced with `exit 1`, shadowed with `exit 2`, Trivy pointed at a missing path | RED |
+| `skipped` | `scan_mode` that matches no scan step, so every scanner step is skipped | RED |
+
+The `verify` job asserts each case's `Security Gate` conclusion, so a green self-test run
+means the clean case passed and every failure case was blocked.
 
 ## VPS layout (`/opt/security-scanner`)
 
@@ -237,10 +255,10 @@ and both files.
   This repo gates its own PRs with the **local** `./.github/workflows/security-scan.yml`
   so a change to the scanner is validated by the version in the PR, not the
   one already merged.
-- **Latest Node only**: marketplace actions are pinned to their newest majors
-  (checkout@v7, upload-artifact@v7, download-artifact@v8, setup-python@v7,
-  github-script@v9); Dependabot keeps them current weekly.
-- Scanner jobs never fail on findings; only the `security-gate` job can block.
+- **Actions pinned by full commit SHA** with a `# vX.Y.Z` comment (checkout v7,
+  upload-artifact v7, setup-python v7, github-script v9, cache v5, trivy-action);
+  Dependabot bumps the SHA and the comment monthly.
+- Scanner steps never fail on findings; only the `security-gate` job can block.
 - Daily full scans report backlog; they never gate.
 - `CODEOWNERS` routes reviews; it is not a merge gate while there is a single
   owner (see the comment in the file).
