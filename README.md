@@ -23,6 +23,9 @@ Copy `examples/pr-security.yml` to `.github/workflows/pr-security.yml`
 ```yaml
 name: PR Security
 on: [pull_request]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
   pull-requests: write
