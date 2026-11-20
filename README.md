@@ -178,7 +178,8 @@ gh workflow run security-self-test.yml --ref <branch>             # every case
 gh workflow run security-self-test.yml --ref <branch> -f case=trivy
 ```
 
-It also runs on any PR that changes `security-scan.yml` or the self-test. Each case calls
+Dispatch-only (its failure cases end red by design, which would read as failing PR
+checks); run it on the branch of every change to `security-scan.yml`. Each case calls
 the real reusable workflow. The scan job commits a fixture generated at runtime (never
 pushed) and scans that one commit, so no real secret or vulnerable code lands on a branch:
 

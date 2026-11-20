@@ -46,9 +46,10 @@ a SHA.
 1. Open the PR: the PR's own `pr-security` run uses your modified
    `security-scan.yml`, so it is the integration test. Read the PR comment table and the
    scan job's three "Record Status" steps, not just the green check.
-2. The PR also triggers **Security Self-Test** (every case); `verify` must be green,
-   meaning clean passed and every finding/error/skipped case turned the gate red. Rerun
-   one case with `gh workflow run security-self-test.yml --ref <branch> -f case=<case>`.
+2. Run **Security Self-Test** on the branch: `gh workflow run security-self-test.yml
+   --ref <branch>` (every case; `-f case=<case>` for one). `verify` must be green, meaning
+   clean passed and every finding/error/skipped case turned the gate red. Link the run in
+   the PR.
    Never set `simulate_crash` or `self_test` in a consumer repo.
 3. Toolchain/DB changes: `deploy/install-tools.sh` (idempotent) on the VPS; schema in
    `db/schema.sql`; ingestion in `scripts/secscan-ingest.sh`. Check the next daily run

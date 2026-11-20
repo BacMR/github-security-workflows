@@ -17,7 +17,9 @@ name: Security Self-Test
 # The `verify` job asserts every case's `Security Gate` job concluded as expected, so a
 # green run of this workflow means: clean passed and every failure case was blocked.
 #
-# Runs on workflow_dispatch, and on PRs that change the gate or this file.
+# workflow_dispatch only: the failure cases end with a RED `Security Gate` job by design,
+# which would read as failing checks on a PR. Dispatch it after every gate change:
+#   gh workflow run security-self-test.yml --ref <branch> [-f case=<case>]
 
 on:
   workflow_dispatch:
@@ -37,10 +39,6 @@ on:
           - crash-semgrep
           - crash-trivy
           - skipped
-  pull_request:
-    paths:
-      - .github/workflows/security-scan.yml
-      - .github/workflows/security-self-test.yml
 
 concurrency:
   group: security-self-test-${{ github.ref }}-${{ inputs.case || 'all' }}
