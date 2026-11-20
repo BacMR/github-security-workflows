@@ -21,8 +21,12 @@ guide for the repo; it adds the working conventions. There is no `CLAUDE.md`.
 ## Workflows
 
 - `security-scan.yml` — reusable (`workflow_call`) PR Security Gate on GitHub-hosted
-  runners. Scanner jobs (Gitleaks, Trivy, Semgrep) never fail on findings; only
-  `security-gate` can block, and only when `enforce_new_findings: true`.
+  runners. One `scan` job runs Gitleaks, Semgrep and Trivy as steps that never fail on
+  findings; only `security-gate` (on `ubuntu-slim`) can block, and it is always
+  fail-closed (the `fail_closed` input is deprecated and ignored). Required check name:
+  `security / Security Gate` — never rename the `Security Gate` job.
+- `security-self-test.yml` — proves the gate fails closed (findings, scanner errors,
+  skipped steps) against runtime-generated fixtures; dispatch it after a gate change.
 - `scheduled-org-scan.yml` — daily 05:00 UTC full scan of every non-archived org repo
   on the VPS self-hosted runner (`/opt/security-scanner`, label `secscan`); reports go
   to the `secscan` Postgres DB. Never gates. Only this workflow may use the
@@ -32,26 +36,23 @@ guide for the repo; it adds the working conventions. There is no `CLAUDE.md`.
 
 ## Action pinning
 
-Marketplace actions track their newest major tag (`actions/checkout@v7`, …) and
-Dependabot (monthly, grouped patch/minor, 7-day cooldown) keeps them current.
-Third-party actions outside the GitHub/aquasecurity first-party set that run with
-privileged tokens (e.g. `dependabot/fetch-metadata`) are pinned to a full commit SHA
-with a `# vX.Y.Z` comment. Do not add an unpinned third-party action; pin new ones to a
-SHA.
+`security-scan.yml` and `security-self-test.yml` pin every action to a full commit SHA
+with a `# vX.Y.Z` comment, and so do third-party actions that run with privileged tokens
+(e.g. `dependabot/fetch-metadata`). Dependabot (monthly, grouped patch/minor, 7-day
+cooldown) bumps SHA and comment together. Do not add an unpinned action; pin new ones to
+a SHA.
 
 ## Testing a scanner change
 
 1. Open the PR: the PR's own `pr-security` run uses your modified
    `security-scan.yml`, so it is the integration test. Read the PR comment table and the
-   three scanner jobs, not just the green check.
-2. To prove a scanner still detects, push a throwaway commit on the branch with a
-   known-bad sample (fake secret, vulnerable manifest, Semgrep-matching code), confirm
-   the gate fails with `enforce_new_findings: true`, then drop the commit.
-3. Read the gate's **Check Scanner Integrity** step: all three scanners must be `ok`.
-   Until `fail_closed` defaults to `true` (see README rollout plan) a crashed scanner
-   only warns. To re-prove fail-closed, use the `simulate_crash` throwaway-commit
-   procedure in `README.md`; never set `simulate_crash` in a consumer repo.
-4. Toolchain/DB changes: `deploy/install-tools.sh` (idempotent) on the VPS; schema in
+   scan job's three "Record Status" steps, not just the green check.
+2. Run **Security Self-Test** on the branch: `gh workflow run security-self-test.yml
+   --ref <branch>` (every case; `-f case=<case>` for one). `verify` must be green, meaning
+   clean passed and every finding/error/skipped case turned the gate red. Link the run in
+   the PR.
+   Never set `simulate_crash` or `self_test` in a consumer repo.
+3. Toolchain/DB changes: `deploy/install-tools.sh` (idempotent) on the VPS; schema in
    `db/schema.sql`; ingestion in `scripts/secscan-ingest.sh`. Check the next daily run
    in `scan_runs` afterwards.
 

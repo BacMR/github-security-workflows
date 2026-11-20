@@ -5,7 +5,7 @@ name: Security Scan
 #
 # WHERE THIS RUNS  (changed 2026-10-16 — back to GitHub-hosted; see history below)
 #
-#   Every job runs on `ubuntu-latest`.
+#   The scan job runs on GitHub-hosted `ubuntu-24.04`; the gate job on `ubuntu-slim`.
 #
 #   WHY IT MOVED BACK. On 2026-10-06 all four jobs were moved to
 #   `[self-hosted, bacmr-ci-vps]`, the containerised ephemeral runner at
@@ -46,11 +46,19 @@ name: Security Scan
 #   third-party dependency trees, and the deploy runner keeps `VPS_SSH_KEY` off hosted
 #   runners.
 #
-#   COST NOTE, for whoever revisits this: these four jobs do ~80 seconds of real
-#   scanning but bill as ~4.3 minutes per run, because GitHub rounds every job up to a
-#   whole minute — 1,180 minutes, 32% of all org Actions minutes in October 2026.
-#   Consolidating the three scanners into one job is the obvious optimisation and would
-#   cut both the bill and the wall clock. That, not self-hosting, is the right lever.
+#   COST NOTE (2026-11-19): the three scanners used to run as three jobs (~80 s of real
+#   scanning) and billed ~4.3 minutes per run, because GitHub rounds every job up to a
+#   whole minute. They now run as steps of ONE `scan` job, and the `security-gate` job,
+#   which only reads that job's outputs, runs on the 1-vCPU `ubuntu-slim` runner.
+#
+# FAIL-CLOSED DESIGN (one scan job, one gate job)
+#
+#   Every scanner step keeps going on failure (`continue-on-error`) so all three scanners
+#   always report. Per scanner, a "Record <Scanner> Status" step validates the raw tool
+#   output and EXITS NON-ZERO unless the scanner ran cleanly; its `outcome` (success /
+#   failure / skipped / cancelled) is a job output. The gate passes only when the scan
+#   job's result is `success` AND all three outcomes are exactly `success`; a missing
+#   output is not `success`, so it is red too.
 
 on:
   workflow_call:
@@ -67,24 +75,35 @@ on:
         type: boolean
         default: false
 
-      # Issue #14. When true, the gate FAILS unless all three scanners wrote a
-      # parsable `<scanner>-status.json` with `status: ok` and their jobs succeeded.
-      # Default false = previous decisions unchanged; the gate only warns about
-      # missing/failed scanners. Rollout: enable per repo, then flip this default.
+      # DEPRECATED and IGNORED (2026-11-19): the gate is always fail-closed. Still
+      # declared so callers that pass it do not break; `false` only emits a warning.
+      # History: issue #14 added it default-off, issue #18 flipped it on after 504
+      # scanner downloads let PRs merge unscanned.
       fail_closed:
-        description: "Fail the security gate when any scanner crashed or produced no/unparsable output"
+        description: "DEPRECATED, ignored: the security gate is always fail-closed"
         required: false
         type: boolean
-        # Flipped to true for issue #18: on 2026-11-08 Trivy/Gitleaks died on 504
-        # downloads in many PRs and the gate still passed. A scanner that did not run
-        # cleanly now fails the gate; a repo can opt out with `fail_closed: false`.
         default: true
 
-      # TEST-ONLY. Deliberately breaks one scanner so the fail_closed path can be
+      # TEST-ONLY. Deliberately breaks one scanner so the fail-closed path can be
       # proven (see README "Proving the gate fails closed"). Consumer repos must never
       # set it. One of: none, gitleaks, trivy, semgrep.
       simulate_crash:
         description: "TEST ONLY: break one scanner on purpose (none|gitleaks|trivy|semgrep)"
+        required: false
+        type: string
+        default: "none"
+
+      # TEST-ONLY, used by security-self-test.yml. Commits a fixture generated at runtime
+      # (never pushed) on top of the checkout and scans that one commit:
+      #   clean    -> harmless file, gate must be GREEN
+      #   gitleaks -> fake, obviously test-only GitHub PAT + AWS key id
+      #   semgrep  -> Python file matching p/default rules
+      #   trivy    -> requirements.txt pinning known-vulnerable Django/PyYAML
+      #   error    -> harmless file, then the gitleaks binary is deleted (exit 127)
+      # Refused (scan job fails) outside BacMR/github-security-workflows.
+      self_test:
+        description: "TEST ONLY: none|clean|gitleaks|semgrep|trivy|error (security-self-test.yml)"
         required: false
         type: string
         default: "none"
@@ -99,14 +118,14 @@ env:
   TRIVY_VERSION: "0.70.0"
   TRIVY_SHA256: "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
 
-# ============================================================
-# GITLEAKS
-# ============================================================
-
 jobs:
 
-  gitleaks:
-    name: Gitleaks
+# ============================================================
+# SCAN — Semgrep, Gitleaks, Trivy as steps of one job
+# ============================================================
+
+  scan:
+    name: Scan (Gitleaks, Semgrep, Trivy)
     # PINNED deliberately, not `ubuntu-latest`. GitHub flips the `ubuntu-latest`
     # alias to Ubuntu 26 on 2026-10-19, which would change the OS, the default
     # Python/Node and the preinstalled tooling underneath a REQUIRED check without
@@ -122,17 +141,243 @@ jobs:
     # This is a pin, not a decision to sit on 24.04 forever -- revisit it, do not
     # let it fossilise.
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Was 15 per scanner job when they ran in parallel; now they run in sequence.
+    timeout-minutes: 25
 
     permissions:
       contents: read
 
+    # Vulnerability DB mirrors, tried in order (issue #18): AWS ECR Public first, then
+    # Google's mirror, then ghcr.io, so one registry having a bad day does not stop the
+    # scan. The DB itself is cached by trivy-action (`cache: true`, actions/cache keyed
+    # by date with a restore-key fallback to the newest older day).
+    env:
+      TRIVY_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-db:2,mirror.gcr.io/aquasec/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+      TRIVY_JAVA_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-java-db:1,mirror.gcr.io/aquasec/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1"
+
+    # The gate decides from these alone. `*_outcome` is the outcome of each scanner's
+    # "Record Status" step, which exits non-zero unless that scanner ran cleanly.
+    outputs:
+      gitleaks_outcome: ${{ steps.gitleaks_status.outcome }}
+      semgrep_outcome: ${{ steps.semgrep_status.outcome }}
+      trivy_outcome: ${{ steps.trivy_status.outcome }}
+      gitleaks_reason: ${{ steps.gitleaks_status.outputs.reason }}
+      semgrep_reason: ${{ steps.semgrep_status.outputs.reason }}
+      trivy_reason: ${{ steps.trivy_status.outputs.reason }}
+      gitleaks_new: ${{ steps.findings.outputs.gitleaks_new }}
+      trivy_new: ${{ steps.findings.outputs.trivy_new }}
+      semgrep_new: ${{ steps.findings.outputs.semgrep_new }}
+      total_new: ${{ steps.findings.outputs.total_new }}
+
     steps:
 
       - name: Checkout Code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      # For real callers (self_test=none) this only forwards the PR's base/head SHAs.
+      # For the self-test it commits a runtime-generated fixture and scans that commit.
+      - name: Resolve Scan Range
+        id: range
+        env:
+          SELF_TEST: ${{ inputs.self_test }}
+          REPOSITORY: ${{ github.repository }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$SELF_TEST" = "none" ]; then
+            { echo "base=${PR_BASE_SHA}"; echo "head=${PR_HEAD_SHA}"; } >> "$GITHUB_OUTPUT"
+            echo "Scan range: ${PR_BASE_SHA}..${PR_HEAD_SHA}"
+            exit 0
+          fi
+          if [ "$REPOSITORY" != "BacMR/github-security-workflows" ]; then
+            echo "::error::self_test is test-only; it runs only in BacMR/github-security-workflows"
+            exit 1
+          fi
+          case "$SELF_TEST" in
+            clean|gitleaks|semgrep|trivy|error) ;;
+            *) echo "::error::Unknown self_test '${SELF_TEST}' (expected none|clean|gitleaks|semgrep|trivy|error)"; exit 1 ;;
+          esac
+          base=$(git rev-parse HEAD)
+          dir=.bacmr-self-test
+          mkdir -p "$dir"
+          echo "BacMR security self-test fixture (${SELF_TEST}), generated at runtime and never pushed." > "$dir/README.txt"
+          case "$SELF_TEST" in
+            gitleaks)
+              # FAKE, random, test-only values in real token formats.
+              tok="ghp_SELFTEST$(openssl rand -hex 14)"
+              akid="AKIASELFTEST$(openssl rand -hex 4 | tr '0-9a-f' 'ABCDEFGHIJKLMNOP')"
+              printf 'GITHUB_TOKEN=%s\nAWS_ACCESS_KEY_ID=%s\n' "$tok" "$akid" > "$dir/fake-credentials.env"
+              ;;
+            semgrep)
+              cat > "$dir/semgrep_fixture.py" <<'PY'
+          import subprocess
+          from flask import Flask, request
+          app = Flask(__name__)
+          @app.route("/run")
+          def run():
+              subprocess.call(request.args.get("cmd"), shell=True)
+              return eval(request.args.get("expr"))
+          if __name__ == "__main__":
+              app.run(debug=True, host="0.0.0.0")
+          PY
+              ;;
+            trivy)
+              printf 'Django==2.2.0\nPyYAML==5.3\n' > "$dir/requirements.txt"
+              ;;
+          esac
+          git add "$dir"
+          git -c user.name="bacmr-self-test" -c user.email="self-test@invalid" commit -q --no-verify -m "self-test fixture: ${SELF_TEST}"
+          head=$(git rev-parse HEAD)
+          { echo "base=${base}"; echo "head=${head}"; } >> "$GITHUB_OUTPUT"
+          echo "Self-test '${SELF_TEST}': scan range ${base}..${head}"
+          git show --stat --format='%h %s' HEAD
+
+      # ======================================================
+      # SEMGREP — runs first: --baseline-commit needs a clean
+      # tracked tree, before the other scanners write anything.
+      # ======================================================
+
+      # PINNED, not "3.x" (found via issue #14's integrity check, 2026-10-29): once
+      # "3.x" resolved to Python 3.15, semgrep 1.182 crashed on every run
+      # ("semgrep-core exited with -11" / "exited with 1") in knowledge, api-gateway,
+      # web-platform and this repo, and the old gate read the crash as zero findings.
+      # 3.12 is verified locally with the same semgrep version. Move it on purpose.
+      - name: Set up Python
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip
+          # PINNED: the version verified on Python 3.12 (issue #14). Dependabot does
+          # not track pip installs inside workflow `run:` steps, so bump this
+          # deliberately and check the gate's integrity step reports semgrep ok.
+          python -m pip install semgrep==1.182.1
+          semgrep --version
+
+      - name: Simulate Semgrep Crash (test only)
+        if: ${{ !cancelled() && inputs.simulate_crash == 'semgrep' }}
+        run: |
+          echo "::warning::simulate_crash=semgrep: shadowing semgrep with 'exit 2'"
+          mkdir -p "$RUNNER_TEMP/simulated-crash"
+          printf '#!/bin/sh\necho "simulated semgrep crash" >&2\nexit 2\n' > "$RUNNER_TEMP/simulated-crash/semgrep"
+          chmod +x "$RUNNER_TEMP/simulated-crash/semgrep"
+          echo "$RUNNER_TEMP/simulated-crash" >> "$GITHUB_PATH"
+
+      # Remove any same-named file that came with the checkout, so a file committed
+      # in the target repo can never stand in for the report of a crashed scanner.
+      - name: Remove Stale Semgrep Reports
+        if: ${{ !cancelled() }}
+        run: rm -f semgrep-new-findings.json semgrep-full.json semgrep-status.json
+
+      - name: Run Semgrep - PR Changes
+        id: semgrep_pr
+        if: ${{ !cancelled() && inputs.scan_mode == 'pr' }}
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ steps.range.outputs.base }}
+        run: |
+          set +e
+
+          semgrep scan \
+            --config p/default \
+            --baseline-commit "${BASE_SHA}" \
+            --json \
+            --output semgrep-new-findings.json \
+            --metrics off
+          rc=$?
+
+          echo "Semgrep exit code: ${rc}"
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Run Semgrep - Full Repository
+        id: semgrep_full
+        if: ${{ !cancelled() && inputs.scan_mode == 'full' }}
+        continue-on-error: true
+        run: |
+          set +e
+
+          semgrep scan \
+            --config p/default \
+            --json \
+            --output semgrep-full.json \
+            --metrics off
+          rc=$?
+
+          echo "Semgrep exit code: ${rc}"
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # Must run BEFORE "Ensure Semgrep Report Exists", which writes an empty stub.
+      # ok = semgrep exited 0/1 (1 = findings with --error; >=2 is a semgrep error)
+      # and the report is an object with a `results` array. Exits 1 unless ok, so this
+      # step's outcome is the scanner verdict the gate reads.
+      - name: Record Semgrep Status
+        id: semgrep_status
+        if: always()
+        continue-on-error: true
+        env:
+          SCAN_MODE: ${{ inputs.scan_mode }}
+          RC: ${{ inputs.scan_mode == 'pr' && steps.semgrep_pr.outputs.rc || steps.semgrep_full.outputs.rc }}
+        run: |
+          set -uo pipefail
+          if [ "$SCAN_MODE" = "pr" ]; then REPORT=semgrep-new-findings.json; else REPORT=semgrep-full.json; fi
+          VERSION=$( (semgrep --version 2>/dev/null || true) | head -n1)
+          STATUS=failed; REASON=""; FINDINGS=null
+          if [ -z "$RC" ]; then
+            REASON="scan step did not run"
+          elif [ "$RC" != "0" ] && [ "$RC" != "1" ]; then
+            REASON="semgrep exited ${RC}"
+          elif [ ! -s "$REPORT" ]; then
+            REASON="semgrep exited ${RC} but wrote no report"
+          elif ! FINDINGS=$(jq -e 'if (.results | type) == "array" then (.results | length) else error("no results array") end' "$REPORT" 2>/dev/null); then
+            FINDINGS=null; REASON="report has no results array"
+          else
+            STATUS=ok
+          fi
+          jq -n --arg status "$STATUS" --arg reason "$REASON" --arg mode "$SCAN_MODE" \
+            --arg version "${VERSION:-unknown}" --arg rc "${RC:-}" --argjson findings "$FINDINGS" \
+            '{scanner: "semgrep", status: $status, reason: $reason, scan_mode: $mode,
+              tool_version: $version, exit_code: $rc, findings: $findings}' > semgrep-status.json
+          cat semgrep-status.json
+          echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+          [ "$STATUS" = "ok" ] || { echo "::error title=Semgrep did not run cleanly::${REASON}"; exit 1; }
+
+      - name: Ensure Semgrep Report Exists
+        if: always()
+        env:
+          SCAN_MODE: ${{ inputs.scan_mode }}
+        run: |
+          if [ "$SCAN_MODE" = "pr" ]; then
+            [ -f semgrep-new-findings.json ] || echo '{"results":[]}' > semgrep-new-findings.json
+          else
+            [ -f semgrep-full.json ] || echo '{"results":[]}' > semgrep-full.json
+          fi
+
+      - name: Upload Semgrep Report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: semgrep-results
+          path: |
+            semgrep-new-findings.json
+            semgrep-full.json
+            semgrep-status.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # ======================================================
+      # GITLEAKS
+      # ======================================================
 
       # Issue #18. On 2026-11-08 github.com/<org>/<repo>/releases/download/... returned
       # HTTP 504 for hours while the API asset endpoint (api.github.com/.../releases/
@@ -140,12 +385,16 @@ jobs:
       # verified tarball cache -> direct URL -> API asset endpoint, retried with
       # exponential backoff, always checked against the pinned GITLEAKS_SHA256.
       - name: Restore Gitleaks Tarball Cache
+        if: ${{ !cancelled() }}
+        continue-on-error: true
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.cache/bacmr-tools/gitleaks
           key: gitleaks-${{ runner.os }}-${{ env.GITLEAKS_VERSION }}-${{ env.GITLEAKS_SHA256 }}
 
       - name: Install Gitleaks
+        if: ${{ !cancelled() }}
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -190,27 +439,29 @@ jobs:
           gitleaks version
 
       - name: Simulate Gitleaks Crash (test only)
-        if: inputs.simulate_crash == 'gitleaks'
+        if: ${{ !cancelled() && inputs.simulate_crash == 'gitleaks' }}
         run: |
           echo "::warning::simulate_crash=gitleaks: replacing the gitleaks binary with 'exit 1'"
           printf '#!/bin/sh\necho "simulated gitleaks crash" >&2\nexit 1\n' | sudo tee /usr/local/bin/gitleaks >/dev/null
           sudo chmod +x /usr/local/bin/gitleaks
 
-      # Remove any same-named file that came with the checkout, so a file committed
-      # in the target repo can never stand in for the report of a crashed scanner.
-      - name: Remove Stale Gitleaks Reports
-        run: rm -f gitleaks-new-findings.json gitleaks-full-report.json gitleaks-status.json
+      - name: Simulate Missing Scanner Binary (self-test only)
+        if: ${{ !cancelled() && inputs.self_test == 'error' }}
+        run: |
+          echo "::warning::self_test=error: deleting the gitleaks binary"
+          sudo rm -f /usr/local/bin/gitleaks
 
-      # ======================================================
-      # PR SCAN
-      # ======================================================
+      - name: Remove Stale Gitleaks Reports
+        if: ${{ !cancelled() }}
+        run: rm -f gitleaks-new-findings.json gitleaks-full-report.json gitleaks-status.json
 
       - name: Run Gitleaks - PR Changes
         id: gitleaks_pr
-        if: inputs.scan_mode == 'pr'
+        if: ${{ !cancelled() && inputs.scan_mode == 'pr' }}
+        continue-on-error: true
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ steps.range.outputs.base }}
+          HEAD_SHA: ${{ steps.range.outputs.head }}
         run: |
           set +e
 
@@ -232,13 +483,10 @@ jobs:
           # The security-gate job decides whether findings block the PR.
           exit 0
 
-      # ======================================================
-      # FULL SCAN
-      # ======================================================
-
       - name: Run Gitleaks - Full Repository
         id: gitleaks_full
-        if: inputs.scan_mode == 'full'
+        if: ${{ !cancelled() && inputs.scan_mode == 'full' }}
+        continue-on-error: true
         run: |
           set +e
 
@@ -258,9 +506,11 @@ jobs:
       # Must run BEFORE "Ensure Gitleaks Report Exists", which writes an empty stub.
       # ok = scan step ran, exited 0 (clean) or 1 (leaks found), and its report is a
       # JSON array. Gitleaks writes no report on a fatal error, so a crash cannot
-      # masquerade as a clean scan here.
+      # masquerade as a clean scan here. Exits 1 unless ok (outcome = verdict).
       - name: Record Gitleaks Status
+        id: gitleaks_status
         if: always()
+        continue-on-error: true
         env:
           SCAN_MODE: ${{ inputs.scan_mode }}
           RC: ${{ inputs.scan_mode == 'pr' && steps.gitleaks_pr.outputs.rc || steps.gitleaks_full.outputs.rc }}
@@ -285,6 +535,8 @@ jobs:
             '{scanner: "gitleaks", status: $status, reason: $reason, scan_mode: $mode,
               tool_version: $version, exit_code: $rc, findings: $findings}' > gitleaks-status.json
           cat gitleaks-status.json
+          echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+          [ "$STATUS" = "ok" ] || { echo "::error title=Gitleaks did not run cleanly::${REASON}"; exit 1; }
 
       - name: Ensure Gitleaks Report Exists
         if: always()
@@ -299,7 +551,7 @@ jobs:
 
       - name: Upload Gitleaks Report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gitleaks-results
           path: |
@@ -309,43 +561,13 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-# ============================================================
-# TRIVY
-# ============================================================
-
-  trivy:
-    name: Trivy
-    # Pinned for the same reason as the job above -- see that comment. Not
-    # `ubuntu-latest`: the alias becomes Ubuntu 26 on 2026-10-19.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-
-    permissions:
-      contents: read
-
-    # Vulnerability DB mirrors, tried in order (issue #18): AWS ECR Public first, then
-    # Google's mirror, then ghcr.io, so one registry having a bad day does not stop the
-    # scan. The DB itself is cached by trivy-action (`cache: true`, actions/cache keyed
-    # by date with a restore-key fallback to the newest older day).
-    env:
-      TRIVY_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-db:2,mirror.gcr.io/aquasec/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
-      TRIVY_JAVA_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-java-db:1,mirror.gcr.io/aquasec/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1"
-
-    steps:
-
-      - name: Checkout Code
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
       # ======================================================
-      # PR MODE — scan BASE and PR separately;
-      # the security-gate job compares the results.
+      # TRIVY — PR mode scans BASE and PR separately; the
+      # findings step below compares the results.
       # ======================================================
 
-      # Remove any same-named file that came with the checkout, so a file committed
-      # in the target repo can never stand in for the report of a crashed scanner.
       - name: Remove Stale Trivy Reports
+        if: ${{ !cancelled() }}
         run: rm -f trivy-base.json trivy-pr.json trivy-full.json trivy-status.json
 
       # Install Trivy ourselves from the GitHub release, checksum-verified, instead of
@@ -361,6 +583,8 @@ jobs:
       # Gitleaks: verified tarball cache -> direct URL -> API asset endpoint,
       # exponential backoff, pinned sha256 (no second checksums.txt download).
       - name: Restore Trivy Tarball Cache
+        if: ${{ !cancelled() }}
+        continue-on-error: true
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.cache/bacmr-tools/trivy
@@ -368,6 +592,8 @@ jobs:
 
       - name: Install Trivy
         id: trivy_install
+        if: ${{ !cancelled() }}
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -413,17 +639,20 @@ jobs:
           "$HOME/.local/bin/trivy-bin/trivy" --version
 
       - name: Create Base Worktree
-        if: inputs.scan_mode == 'pr'
+        id: trivy_worktree
+        if: ${{ !cancelled() && inputs.scan_mode == 'pr' }}
+        continue-on-error: true
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ steps.range.outputs.base }}
         run: |
           set -euo pipefail
           git worktree add --detach ../base-repository "${BASE_SHA}"
 
       - name: Scan Base Repository
         id: trivy_base
-        if: inputs.scan_mode == 'pr'
-        uses: aquasecurity/trivy-action@v0.36.0
+        if: ${{ !cancelled() && inputs.scan_mode == 'pr' }}
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           skip-setup-trivy: true
           cache: true
@@ -438,8 +667,9 @@ jobs:
 
       - name: Scan PR Repository
         id: trivy_pr
-        if: inputs.scan_mode == 'pr'
-        uses: aquasecurity/trivy-action@v0.36.0
+        if: ${{ !cancelled() && inputs.scan_mode == 'pr' }}
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           skip-setup-trivy: true
           cache: true
@@ -456,8 +686,9 @@ jobs:
 
       - name: Full Trivy Scan
         id: trivy_full
-        if: inputs.scan_mode == 'full'
-        uses: aquasecurity/trivy-action@v0.36.0
+        if: ${{ !cancelled() && inputs.scan_mode == 'full' }}
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           skip-setup-trivy: true
           cache: true
@@ -472,9 +703,11 @@ jobs:
 
       # Must run BEFORE "Ensure Trivy Reports Exist", which writes empty stubs.
       # ok = every scan step for this mode succeeded and each report is a Trivy JSON
-      # document (an object carrying SchemaVersion).
+      # document (an object carrying SchemaVersion). Exits 1 unless ok (outcome = verdict).
       - name: Record Trivy Status
+        id: trivy_status
         if: always()
+        continue-on-error: true
         env:
           SCAN_MODE: ${{ inputs.scan_mode }}
           BASE_OUTCOME: ${{ steps.trivy_base.outcome }}
@@ -507,6 +740,8 @@ jobs:
             '{scanner: "trivy", status: $status, reason: $reason, scan_mode: $mode,
               tool_version: $version, findings: $findings}' > trivy-status.json
           cat trivy-status.json
+          echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+          [ "$STATUS" = "ok" ] || { echo "::error title=Trivy did not run cleanly::${REASON}"; exit 1; }
 
       - name: Ensure Trivy Reports Exist
         if: always()
@@ -517,7 +752,7 @@ jobs:
 
       - name: Upload Trivy Reports
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: trivy-results
           path: |
@@ -528,207 +763,14 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-# ============================================================
-# SEMGREP
-# ============================================================
-
-  semgrep:
-    name: Semgrep
-    # Pinned for the same reason as the job above -- see that comment. Not
-    # `ubuntu-latest`: the alias becomes Ubuntu 26 on 2026-10-19.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-
-    permissions:
-      contents: read
-
-    steps:
-
-      - name: Checkout Code
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      # PINNED, not "3.x" (found via issue #14's integrity check, 2026-10-29): once
-      # "3.x" resolved to Python 3.15, semgrep 1.182 crashed on every run
-      # ("semgrep-core exited with -11" / "exited with 1") in knowledge, api-gateway,
-      # web-platform and this repo, and the old gate read the crash as zero findings.
-      # 3.12 is verified locally with the same semgrep version. Move it on purpose.
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Install Semgrep
-        run: |
-          python -m pip install --upgrade pip
-          # PINNED: the version verified on Python 3.12 (issue #14). Dependabot does
-          # not track pip installs inside workflow `run:` steps, so bump this
-          # deliberately and check the gate's integrity step reports semgrep ok.
-          python -m pip install semgrep==1.182.1
-          semgrep --version
-
-      - name: Simulate Semgrep Crash (test only)
-        if: inputs.simulate_crash == 'semgrep'
-        run: |
-          echo "::warning::simulate_crash=semgrep: shadowing semgrep with 'exit 2'"
-          mkdir -p "$RUNNER_TEMP/simulated-crash"
-          printf '#!/bin/sh\necho "simulated semgrep crash" >&2\nexit 2\n' > "$RUNNER_TEMP/simulated-crash/semgrep"
-          chmod +x "$RUNNER_TEMP/simulated-crash/semgrep"
-          echo "$RUNNER_TEMP/simulated-crash" >> "$GITHUB_PATH"
-
-      # Remove any same-named file that came with the checkout, so a file committed
-      # in the target repo can never stand in for the report of a crashed scanner.
-      - name: Remove Stale Semgrep Reports
-        run: rm -f semgrep-new-findings.json semgrep-full.json semgrep-status.json
-
-      - name: Run Semgrep - PR Changes
-        id: semgrep_pr
-        if: inputs.scan_mode == 'pr'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          set +e
-
-          semgrep scan \
-            --config p/default \
-            --baseline-commit "${BASE_SHA}" \
-            --json \
-            --output semgrep-new-findings.json \
-            --metrics off
-          rc=$?
-
-          echo "Semgrep exit code: ${rc}"
-          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
-          exit 0
-
-      - name: Run Semgrep - Full Repository
-        id: semgrep_full
-        if: inputs.scan_mode == 'full'
-        run: |
-          set +e
-
-          semgrep scan \
-            --config p/default \
-            --json \
-            --output semgrep-full.json \
-            --metrics off
-          rc=$?
-
-          echo "Semgrep exit code: ${rc}"
-          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
-          exit 0
-
-      # Must run BEFORE "Ensure Semgrep Report Exists", which writes an empty stub.
-      # ok = semgrep exited 0/1 (1 = findings with --error; >=2 is a semgrep error)
-      # and the report is an object with a `results` array.
-      - name: Record Semgrep Status
-        if: always()
-        env:
-          SCAN_MODE: ${{ inputs.scan_mode }}
-          RC: ${{ inputs.scan_mode == 'pr' && steps.semgrep_pr.outputs.rc || steps.semgrep_full.outputs.rc }}
-        run: |
-          set -uo pipefail
-          if [ "$SCAN_MODE" = "pr" ]; then REPORT=semgrep-new-findings.json; else REPORT=semgrep-full.json; fi
-          VERSION=$( (semgrep --version 2>/dev/null || true) | head -n1)
-          STATUS=failed; REASON=""; FINDINGS=null
-          if [ -z "$RC" ]; then
-            REASON="scan step did not run"
-          elif [ "$RC" != "0" ] && [ "$RC" != "1" ]; then
-            REASON="semgrep exited ${RC}"
-          elif [ ! -s "$REPORT" ]; then
-            REASON="semgrep exited ${RC} but wrote no report"
-          elif ! FINDINGS=$(jq -e 'if (.results | type) == "array" then (.results | length) else error("no results array") end' "$REPORT" 2>/dev/null); then
-            FINDINGS=null; REASON="report has no results array"
-          else
-            STATUS=ok
-          fi
-          jq -n --arg status "$STATUS" --arg reason "$REASON" --arg mode "$SCAN_MODE" \
-            --arg version "${VERSION:-unknown}" --arg rc "${RC:-}" --argjson findings "$FINDINGS" \
-            '{scanner: "semgrep", status: $status, reason: $reason, scan_mode: $mode,
-              tool_version: $version, exit_code: $rc, findings: $findings}' > semgrep-status.json
-          cat semgrep-status.json
-
-      - name: Ensure Semgrep Report Exists
-        if: always()
-        env:
-          SCAN_MODE: ${{ inputs.scan_mode }}
-        run: |
-          if [ "$SCAN_MODE" = "pr" ]; then
-            [ -f semgrep-new-findings.json ] || echo '{"results":[]}' > semgrep-new-findings.json
-          else
-            [ -f semgrep-full.json ] || echo '{"results":[]}' > semgrep-full.json
-          fi
-
-      - name: Upload Semgrep Report
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: semgrep-results
-          path: |
-            semgrep-new-findings.json
-            semgrep-full.json
-            semgrep-status.json
-          if-no-files-found: ignore
-          retention-days: 30
-
-# ============================================================
-# SECURITY GATE
-#
-# The ONLY job that determines whether the PR security check
-# passes or fails.
-# ============================================================
-
-  security-gate:
-    name: Security Gate
-    # Pinned for the same reason as the job above -- see that comment. Not
-    # `ubuntu-latest`: the alias becomes Ubuntu 26 on 2026-10-19.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-
-    needs:
-      - gitleaks
-      - trivy
-      - semgrep
-
-    if: always()
-
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-
-    steps:
-
-      - name: Validate simulate_crash Input
-        env:
-          SIMULATE_CRASH: ${{ inputs.simulate_crash }}
-        run: |
-          case "$SIMULATE_CRASH" in
-            none|gitleaks|trivy|semgrep) echo "simulate_crash=${SIMULATE_CRASH}" ;;
-            *) echo "::error::Unknown simulate_crash value '${SIMULATE_CRASH}' (expected none|gitleaks|trivy|semgrep)"; exit 1 ;;
-          esac
-
-      - name: Download Gitleaks Results
-        uses: actions/download-artifact@v8
-        with:
-          name: gitleaks-results
-          path: results/gitleaks
-
-      - name: Download Trivy Results
-        uses: actions/download-artifact@v8
-        with:
-          name: trivy-results
-          path: results/trivy
-
-      - name: Download Semgrep Results
-        uses: actions/download-artifact@v8
-        with:
-          name: semgrep-results
-          path: results/semgrep
+      # ======================================================
+      # FINDINGS — counted here, where the reports are, so the
+      # gate job needs no artifacts and no jq.
+      # ======================================================
 
       - name: Analyze Security Findings
         id: findings
+        if: always()
         env:
           SCAN_MODE: ${{ inputs.scan_mode }}
         run: |
@@ -740,9 +782,8 @@ jobs:
 
           if [ "$SCAN_MODE" = "pr" ]; then
 
-            GITLEAKS_FILE="results/gitleaks/gitleaks-new-findings.json"
-            if [ -f "$GITLEAKS_FILE" ]; then
-              GITLEAKS_NEW=$(jq 'length' "$GITLEAKS_FILE" 2>/dev/null || echo 0)
+            if [ -f gitleaks-new-findings.json ]; then
+              GITLEAKS_NEW=$(jq 'length' gitleaks-new-findings.json 2>/dev/null || echo 0)
             fi
 
             # Trivy finding identity:
@@ -756,16 +797,15 @@ jobs:
                   [$result.Target, .VulnerabilityID, .PkgName, .InstalledVersion] |
                   @tsv
                 ] | unique | .[]
-              ' "results/trivy/trivy-${side}.json" 2>/dev/null \
-                | sort > "/tmp/trivy-${side}.txt" || true
+              ' "trivy-${side}.json" 2>/dev/null \
+                | sort > "$RUNNER_TEMP/trivy-${side}.txt" || true
             done
 
-            comm -13 /tmp/trivy-base.txt /tmp/trivy-pr.txt > /tmp/trivy-new.txt
-            TRIVY_NEW=$(wc -l < /tmp/trivy-new.txt | tr -d ' ')
+            comm -13 "$RUNNER_TEMP/trivy-base.txt" "$RUNNER_TEMP/trivy-pr.txt" > "$RUNNER_TEMP/trivy-new.txt"
+            TRIVY_NEW=$(wc -l < "$RUNNER_TEMP/trivy-new.txt" | tr -d ' ')
 
-            SEMGREP_FILE="results/semgrep/semgrep-new-findings.json"
-            if [ -f "$SEMGREP_FILE" ]; then
-              SEMGREP_NEW=$(jq '.results | length' "$SEMGREP_FILE" 2>/dev/null || echo 0)
+            if [ -f semgrep-new-findings.json ]; then
+              SEMGREP_NEW=$(jq '.results | length' semgrep-new-findings.json 2>/dev/null || echo 0)
             fi
 
           else
@@ -773,20 +813,16 @@ jobs:
             # Full scans report the entire existing backlog.
             # They do NOT become merge gates.
 
-            GITLEAKS_FILE="results/gitleaks/gitleaks-full-report.json"
-            TRIVY_FILE="results/trivy/trivy-full.json"
-            SEMGREP_FILE="results/semgrep/semgrep-full.json"
-
-            if [ -f "$GITLEAKS_FILE" ]; then
-              GITLEAKS_NEW=$(jq 'length' "$GITLEAKS_FILE" 2>/dev/null || echo 0)
+            if [ -f gitleaks-full-report.json ]; then
+              GITLEAKS_NEW=$(jq 'length' gitleaks-full-report.json 2>/dev/null || echo 0)
             fi
 
-            if [ -f "$TRIVY_FILE" ]; then
-              TRIVY_NEW=$(jq '[.Results[]?.Vulnerabilities // []] | flatten | length' "$TRIVY_FILE" 2>/dev/null || echo 0)
+            if [ -f trivy-full.json ]; then
+              TRIVY_NEW=$(jq '[.Results[]?.Vulnerabilities // []] | flatten | length' trivy-full.json 2>/dev/null || echo 0)
             fi
 
-            if [ -f "$SEMGREP_FILE" ]; then
-              SEMGREP_NEW=$(jq '.results | length' "$SEMGREP_FILE" 2>/dev/null || echo 0)
+            if [ -f semgrep-full.json ]; then
+              SEMGREP_NEW=$(jq '.results | length' semgrep-full.json 2>/dev/null || echo 0)
             fi
 
           fi
@@ -805,46 +841,85 @@ jobs:
             echo "total_new=${TOTAL_NEW}"
           } >> "$GITHUB_OUTPUT"
 
-      # Issue #14: a scanner is healthy only if its job succeeded AND it uploaded a
-      # parsable <scanner>-status.json with status "ok". This step never fails; it
-      # warns loudly in every run. "Enforce Scanner Integrity" below acts on it only
-      # when fail_closed is true.
+# ============================================================
+# SECURITY GATE
+#
+# The ONLY job that determines whether the PR security check
+# passes or fails. Reads the scan job's outputs; no checkout,
+# no artifacts, no scanner tooling.
+# ============================================================
+
+  security-gate:
+    name: Security Gate
+    # Bookkeeping only: 1 vCPU, a fraction of a standard minute. Needs bash and the
+    # Node runtime for github-script, nothing else.
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+
+    needs:
+      - scan
+
+    if: always()
+
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+
+      - name: Validate Inputs
+        env:
+          SIMULATE_CRASH: ${{ inputs.simulate_crash }}
+          SELF_TEST: ${{ inputs.self_test }}
+          FAIL_CLOSED: ${{ inputs.fail_closed }}
+        run: |
+          if [ "$FAIL_CLOSED" != "true" ]; then
+            echo "::warning title=fail_closed is deprecated::fail_closed is deprecated and ignored; the security gate is always fail-closed. Remove it from this repo's pr-security.yml."
+          fi
+          case "$SIMULATE_CRASH" in
+            none|gitleaks|trivy|semgrep) echo "simulate_crash=${SIMULATE_CRASH}" ;;
+            *) echo "::error::Unknown simulate_crash value '${SIMULATE_CRASH}' (expected none|gitleaks|trivy|semgrep)"; exit 1 ;;
+          esac
+          case "$SELF_TEST" in
+            none|clean|gitleaks|semgrep|trivy|error) echo "self_test=${SELF_TEST}" ;;
+            *) echo "::error::Unknown self_test value '${SELF_TEST}' (expected none|clean|gitleaks|semgrep|trivy|error)"; exit 1 ;;
+          esac
+
+      # Healthy = scan job result `success` AND each scanner's recorded outcome is
+      # exactly `success`. Anything else, including an empty (missing) output, is a
+      # problem. This step never fails; "Enforce Scanner Integrity" acts on it.
       - name: Check Scanner Integrity
         id: integrity
         env:
-          GITLEAKS_RESULT: ${{ needs.gitleaks.result }}
-          TRIVY_RESULT: ${{ needs.trivy.result }}
-          SEMGREP_RESULT: ${{ needs.semgrep.result }}
-          FAIL_CLOSED: ${{ inputs.fail_closed }}
+          SCAN_RESULT: ${{ needs.scan.result }}
+          GITLEAKS_OUTCOME: ${{ needs.scan.outputs.gitleaks_outcome }}
+          SEMGREP_OUTCOME: ${{ needs.scan.outputs.semgrep_outcome }}
+          TRIVY_OUTCOME: ${{ needs.scan.outputs.trivy_outcome }}
+          GITLEAKS_REASON: ${{ needs.scan.outputs.gitleaks_reason }}
+          SEMGREP_REASON: ${{ needs.scan.outputs.semgrep_reason }}
+          TRIVY_REASON: ${{ needs.scan.outputs.trivy_reason }}
         run: |
           set -uo pipefail
           PROBLEMS=""
-          for s in gitleaks trivy semgrep; do
-            f="results/${s}/${s}-status.json"
-            var="$(echo "$s" | tr '[:lower:]' '[:upper:]')_RESULT"
-            job_result="${!var}"
-            problem=""
-            if [ ! -f "$f" ]; then
-              problem="no status file (job result: ${job_result})"
-            elif ! status=$(jq -er '.status | strings' "$f" 2>/dev/null); then
-              problem="status file unparsable (job result: ${job_result})"
-            elif [ "$status" != "ok" ]; then
-              problem="status '${status}': $(jq -r '.reason // ""' "$f") (job result: ${job_result})"
-            elif [ "$job_result" != "success" ]; then
-              problem="job result '${job_result}'"
-            fi
-            if [ -n "$problem" ]; then
+          if [ "$SCAN_RESULT" != "success" ]; then
+            echo "::warning title=Scan job did not succeed::scan job result '${SCAN_RESULT:-missing}'"
+            PROBLEMS="scan job result '${SCAN_RESULT:-missing}'; "
+          fi
+          for s in gitleaks semgrep trivy; do
+            up="$(echo "$s" | tr '[:lower:]' '[:upper:]')"
+            outcome_var="${up}_OUTCOME"; reason_var="${up}_REASON"
+            outcome="${!outcome_var}"; reason="${!reason_var}"
+            if [ "$outcome" = "success" ]; then
+              echo "${s}: success"
+            else
+              problem="outcome '${outcome:-missing}'${reason:+: ${reason}}"
               echo "::warning title=Scanner ${s} did not run cleanly::${s}: ${problem}. Its findings count is NOT trustworthy."
               PROBLEMS="${PROBLEMS}${s}: ${problem}; "
-            else
-              echo "${s}: ok ($(jq -c '{tool_version, findings}' "$f"))"
             fi
           done
           if [ -n "$PROBLEMS" ]; then
             echo "ok=false" >> "$GITHUB_OUTPUT"
-            if [ "$FAIL_CLOSED" != "true" ]; then
-              echo "::warning title=Security Gate is failing OPEN::fail_closed is false, so this gate still passes although a scanner did not run cleanly: ${PROBLEMS}"
-            fi
           else
             echo "ok=true" >> "$GITHUB_OUTPUT"
           fi
@@ -852,14 +927,13 @@ jobs:
 
       - name: Write Security Summary
         env:
-          GITLEAKS_NEW: ${{ steps.findings.outputs.gitleaks_new }}
-          TRIVY_NEW: ${{ steps.findings.outputs.trivy_new }}
-          SEMGREP_NEW: ${{ steps.findings.outputs.semgrep_new }}
-          TOTAL_NEW: ${{ steps.findings.outputs.total_new }}
+          GITLEAKS_NEW: ${{ needs.scan.outputs.gitleaks_new }}
+          TRIVY_NEW: ${{ needs.scan.outputs.trivy_new }}
+          SEMGREP_NEW: ${{ needs.scan.outputs.semgrep_new }}
+          TOTAL_NEW: ${{ needs.scan.outputs.total_new }}
           SCAN_MODE: ${{ inputs.scan_mode }}
           INTEGRITY_OK: ${{ steps.integrity.outputs.ok }}
           INTEGRITY_PROBLEMS: ${{ steps.integrity.outputs.problems }}
-          FAIL_CLOSED: ${{ inputs.fail_closed }}
         run: |
           {
             echo "# 🛡️ Security Scan Results"
@@ -885,40 +959,35 @@ jobs:
               echo ""
               echo "${INTEGRITY_PROBLEMS}"
               echo ""
-              if [ "$FAIL_CLOSED" = "true" ]; then
-                echo "\`fail_closed: true\` — the gate fails."
-              else
-                echo "\`fail_closed: false\` — the gate is failing open; the counts above are not trustworthy."
-              fi
+              echo "The gate fails: the counts above are not trustworthy."
               echo ""
             fi
 
             if [ "$SCAN_MODE" = "pr" ]; then
-              if [ "$TOTAL_NEW" -eq 0 ]; then
+              if [ "$TOTAL_NEW" = "0" ]; then
                 echo "### ✅ No New Security Findings"
                 echo ""
                 echo "Existing findings are not treated as new findings."
               else
                 echo "### ⚠️ New Security Findings Detected"
                 echo ""
-                echo "This PR introduced ${TOTAL_NEW} new security finding(s)."
+                echo "This PR introduced ${TOTAL_NEW:-an unknown number of} new security finding(s)."
               fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment on Pull Request
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && inputs.self_test == 'none'
         continue-on-error: true
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          GITLEAKS_NEW: ${{ steps.findings.outputs.gitleaks_new }}
-          TRIVY_NEW: ${{ steps.findings.outputs.trivy_new }}
-          SEMGREP_NEW: ${{ steps.findings.outputs.semgrep_new }}
-          TOTAL_NEW: ${{ steps.findings.outputs.total_new }}
+          GITLEAKS_NEW: ${{ needs.scan.outputs.gitleaks_new }}
+          TRIVY_NEW: ${{ needs.scan.outputs.trivy_new }}
+          SEMGREP_NEW: ${{ needs.scan.outputs.semgrep_new }}
+          TOTAL_NEW: ${{ needs.scan.outputs.total_new }}
           ENFORCE: ${{ inputs.enforce_new_findings }}
           INTEGRITY_OK: ${{ steps.integrity.outputs.ok }}
           INTEGRITY_PROBLEMS: ${{ steps.integrity.outputs.problems }}
-          FAIL_CLOSED: ${{ inputs.fail_closed }}
         with:
           script: |
             const prNumber = context.payload.pull_request?.number;
@@ -960,9 +1029,7 @@ jobs:
             if (process.env.INTEGRITY_OK !== "true") {
               body += `\n\n### ⚠️ Scanner integrity: not all scanners ran cleanly\n\n`;
               body += `${process.env.INTEGRITY_PROBLEMS || "unknown"}\n\n`;
-              body += process.env.FAIL_CLOSED === "true"
-                ? `**fail_closed is on: Security Gate FAILED.**`
-                : `**fail_closed is off: the gate is failing open; the counts above are not trustworthy.**`;
+              body += `**Security Gate FAILED: the gate is always fail-closed.**`;
             }
 
             body += `\n\n🤖 *Security scan results are available in the GitHub Actions run.*`;
@@ -974,14 +1041,27 @@ jobs:
               body
             });
 
+      # A scan job that failed, timed out or was cancelled never produced trustworthy
+      # outputs. (Before the merge, the gate's
+      # artifact download failed in that case, so this is not a behaviour change.)
+      - name: Require Scan Job Success
+        env:
+          SCAN_RESULT: ${{ needs.scan.result }}
+        run: |
+          if [ "$SCAN_RESULT" != "success" ]; then
+            echo "::error::Security gate failed: scan job result '${SCAN_RESULT:-missing}' (expected 'success')"
+            exit 1
+          fi
+          echo "Scan job: success"
+
+      # Always on; the deprecated fail_closed input cannot turn it off.
       - name: Enforce Scanner Integrity
-        if: inputs.fail_closed == true
         env:
           INTEGRITY_OK: ${{ steps.integrity.outputs.ok }}
           INTEGRITY_PROBLEMS: ${{ steps.integrity.outputs.problems }}
         run: |
           if [ "$INTEGRITY_OK" != "true" ]; then
-            echo "::error::Security gate failed (fail_closed): not all scanners ran cleanly: ${INTEGRITY_PROBLEMS}"
+            echo "::error::Security gate failed: not all scanners ran cleanly: ${INTEGRITY_PROBLEMS}"
             exit 1
           fi
           echo "All three scanners ran cleanly."
@@ -989,8 +1069,11 @@ jobs:
       - name: Enforce Security Gate
         if: inputs.scan_mode == 'pr' && inputs.enforce_new_findings == true
         env:
-          TOTAL_NEW: ${{ steps.findings.outputs.total_new }}
+          TOTAL_NEW: ${{ needs.scan.outputs.total_new }}
         run: |
+          case "$TOTAL_NEW" in
+            ''|*[!0-9]*) echo "::error::Security gate failed: findings total '${TOTAL_NEW}' is missing or not a number."; exit 1 ;;
+          esac
           if [ "$TOTAL_NEW" -gt 0 ]; then
             echo "::error::Security gate failed: ${TOTAL_NEW} new security finding(s) were introduced."
             exit 1

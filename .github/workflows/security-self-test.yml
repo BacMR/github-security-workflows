@@ -1,0 +1,156 @@
+name: Security Self-Test
+
+# Proves security-scan.yml fails CLOSED. Each case runs the real reusable workflow
+# against a fixture generated at runtime inside the scan job (fake token, vulnerable
+# manifest, Semgrep-matching code) that is committed locally and never pushed, so no
+# real secret or vulnerable code ever lands on a branch. See README "Proving the gate
+# fails closed".
+#
+#   clean          gate must be GREEN
+#   gitleaks       fake GitHub PAT + AWS key id            -> gate RED (finding)
+#   semgrep        Python matching p/default rules        -> gate RED (finding)
+#   trivy          requirements.txt, Django 2.2.0 etc.    -> gate RED (finding)
+#   error          gitleaks binary deleted (exit 127)     -> gate RED (scanner error)
+#   crash-<s>      simulate_crash=<s> (exit 1/2, bad path) -> gate RED (scanner error)
+#   skipped        scan_mode matches no step, every scanner step is skipped -> gate RED
+#   failopen-crash caller passes deprecated fail_closed: false + semgrep crash
+#                  -> gate still RED, plus the deprecation warning annotation
+#
+# The `verify` job asserts every case's `Security Gate` job concluded as expected, so a
+# green run of this workflow means: clean passed and every failure case was blocked.
+#
+# workflow_dispatch only: the failure cases end with a RED `Security Gate` job by design,
+# which would read as failing checks on a PR. Dispatch it after every gate change:
+#   gh workflow run security-self-test.yml --ref <branch> [-f case=<case>]
+
+on:
+  workflow_dispatch:
+    inputs:
+      case:
+        description: "Which case to run (all = every case)"
+        type: choice
+        default: all
+        options:
+          - all
+          - clean
+          - gitleaks
+          - semgrep
+          - trivy
+          - error
+          - crash-gitleaks
+          - crash-semgrep
+          - crash-trivy
+          - skipped
+          - failopen-crash
+
+concurrency:
+  group: security-self-test-${{ github.ref }}-${{ inputs.case || 'all' }}
+  cancel-in-progress: true
+
+env:
+  ALL_CASES: '["clean","gitleaks","semgrep","trivy","error","crash-gitleaks","crash-semgrep","crash-trivy","skipped","failopen-crash"]'
+
+# The called workflow's gate job requests these; a caller must grant at least as much.
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  cases:
+    name: Select cases
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      cases: ${{ steps.select.outputs.cases }}
+    steps:
+      - name: Select cases
+        id: select
+        env:
+          CASE: ${{ inputs.case || 'all' }}
+        run: |
+          if [ "$CASE" = "all" ]; then
+            echo "cases=${ALL_CASES}" >> "$GITHUB_OUTPUT"
+          else
+            echo "cases=[\"${CASE}\"]" >> "$GITHUB_OUTPUT"
+          fi
+
+  self-test:
+    name: self-test ${{ matrix.case }}
+    needs: cases
+    strategy:
+      fail-fast: false
+      matrix:
+        case: ${{ fromJSON(needs.cases.outputs.cases) }}
+    uses: ./.github/workflows/security-scan.yml
+    with:
+      scan_mode: ${{ matrix.case == 'skipped' && 'self-test-skip-every-step' || 'pr' }}
+      enforce_new_findings: true
+      # Deprecated and ignored by the gate; failopen-crash passes false to prove that.
+      fail_closed: ${{ matrix.case != 'failopen-crash' }}
+      self_test: ${{ (startsWith(matrix.case, 'crash-') || matrix.case == 'skipped' || matrix.case == 'failopen-crash') && 'clean' || matrix.case }}
+      simulate_crash: ${{ matrix.case == 'crash-gitleaks' && 'gitleaks' || (matrix.case == 'crash-semgrep' || matrix.case == 'failopen-crash') && 'semgrep' || matrix.case == 'crash-trivy' && 'trivy' || 'none' }}
+
+  verify:
+    name: Verify gate results
+    needs: [cases, self-test]
+    if: always()
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      checks: read
+    steps:
+      - name: Assert each case's Security Gate conclusion
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CASES: ${{ needs.cases.outputs.cases }}
+        with:
+          script: |
+            const cases = JSON.parse(process.env.CASES || "[]");
+            if (cases.length === 0) {
+              core.setFailed("no cases were selected");
+              return;
+            }
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+              attempt_number: Number(process.env.GITHUB_RUN_ATTEMPT || 1),
+              per_page: 100,
+            });
+            const rows = [];
+            let failed = false;
+            for (const c of cases) {
+              const expected = c === "clean" ? "success" : "failure";
+              const gate = jobs.find((j) => j.name === `self-test ${c} / Security Gate`);
+              const scan = jobs.find((j) => j.name.startsWith(`self-test ${c} / Scan`));
+              const actual = gate ? gate.conclusion : "missing";
+              let ok = actual === expected;
+              let note = "";
+              if (c === "failopen-crash" && gate) {
+                const annotations = await github.paginate(github.rest.checks.listAnnotations, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  check_run_id: gate.id,
+                  per_page: 100,
+                });
+                const warned = annotations.some((a) => a.annotation_level === "warning" && a.message.includes("fail_closed is deprecated and ignored"));
+                note = warned ? "deprecation warning present" : "deprecation warning MISSING";
+                ok = ok && warned;
+              }
+              if (!ok) failed = true;
+              rows.push([c, expected, actual ?? "pending", scan?.conclusion ?? "missing", ok ? "PASS" : "FAIL", note, gate?.html_url ?? ""]);
+            }
+            await core.summary
+              .addHeading("Security gate self-test")
+              .addTable([
+                [{ data: "case", header: true }, { data: "expected gate", header: true }, { data: "actual gate", header: true },
+                 { data: "scan job", header: true }, { data: "result", header: true }, { data: "note", header: true },
+                 { data: "gate job", header: true }],
+                ...rows,
+              ])
+              .write();
+            for (const r of rows) core.info(r.join("  "));
+            if (failed) core.setFailed("at least one case did not end with the expected Security Gate conclusion");
